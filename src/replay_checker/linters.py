@@ -82,6 +82,22 @@ def lint_task(run_root: Path) -> list[str]:
                         "under ## Verification Commands is not a runnable shell command"
                     )
 
+        # Goal quality check
+        if "## Goal" in content:
+            goal_text = content.split("## Goal")[1].split("##")[0].strip()
+            if len(goal_text) < 20:
+                diagnostics.append(
+                    f"goal 过于简略：{len(goal_text)} 字符（建议 ≥20）"
+                )
+            if _is_template_goal(goal_text):
+                diagnostics.append(
+                    "template goal detected: the goal is the default package-compiler "
+                    "template — the case was likely generated without extracting a "
+                    "concrete task description from the source plan"
+                )
+        elif "## Goal" not in content and "## Source" not in content:
+            diagnostics.append("no goal or source section found in TASK.md")
+
     if has_case_task:
         case_content = case_path.read_text(encoding="utf-8", errors="ignore")
 
@@ -152,6 +168,23 @@ def lint_score(run_root: Path) -> list[str]:
         diagnostics.append(
             "missing evidence references: scoring package should contain '## Evidence References' section"
         )
+
+    # Check provenance for non-manual cases
+    is_manual = _scoring_package_is_manual(content, run_root)
+    if not is_manual:
+        if "## Case Provenance & Source Risk" not in content:
+            diagnostics.append(
+                "missing case provenance: non-manual scoring package should contain "
+                "'## Case Provenance & Source Risk' section"
+            )
+        else:
+            _check_provenance_content(content, diagnostics)
+
+    # Check for raw history log leakage
+    _check_raw_log_leakage(content, diagnostics)
+
+    # Check for reference/oracle leakage in scoring package
+    _check_scoring_reference_leakage(content, diagnostics)
 
     return diagnostics
 
@@ -234,6 +267,72 @@ def _extract_verification_entries(content: str) -> list[str]:
             if entry:
                 entries.append(entry)
     return entries
+
+
+def _scoring_package_is_manual(content: str, run_root: Path) -> bool:
+    """Check if the scoring package is for a manual case."""
+    if "Primary source type: `manual`" in content:
+        return True
+    if "source_type: manual" in content.lower():
+        return True
+    case_yaml = run_root.parent.parent / "cases"
+    return False
+
+
+def _check_provenance_content(content: str, diagnostics: list[str]) -> None:
+    """Validate provenance section content in scoring package."""
+    required_fields = [
+        ("Primary source type", "missing primary source type in provenance section"),
+        ("Base commit source", "missing base commit source in provenance section"),
+        ("Merged confidence", "missing merged confidence in provenance section"),
+        ("Overall risk level", "missing overall risk level in provenance section"),
+    ]
+    for field, message in required_fields:
+        if field not in content:
+            diagnostics.append(message)
+
+
+def _check_raw_log_leakage(content: str, diagnostics: list[str]) -> None:
+    """Detect raw conversation log content leaked into scoring package."""
+    raw_indicators = [
+        r'"role"\s*:\s*"user"',
+        r'"role"\s*:\s*"assistant"',
+        r'"content"\s*:\s*"',
+        r'"type"\s*:\s*"message"',
+    ]
+    for pattern in raw_indicators:
+        if re.search(pattern, content):
+            diagnostics.append(
+                f"raw log leakage: scoring package contains raw conversation data "
+                f"(pattern: {pattern})"
+            )
+            break
+
+
+def _check_scoring_reference_leakage(content: str, diagnostics: list[str]) -> None:
+    """Detect reference/oracle content leaked into scoring package.
+
+    _reference/ inside backticks (`_reference/`) is a policy/documentation
+    reference, not leaked data. Only flag bare path uses.
+    """
+    for line in content.splitlines():
+        line_stripped = line.strip().lower()
+        # Bare _reference/ outside backticks is leakage
+        if re.search(r"(?<!`)_reference[/\\]", line):
+            diagnostics.append(
+                "reference leak: scoring package contains leaked _reference/ content"
+            )
+            break
+
+
+_TEMPLATE_GOALS = (
+    "Replay a historical project situation and produce equivalent changes independently.",
+)
+
+
+def _is_template_goal(text: str) -> bool:
+    """Detect the default package-compiler goal that signals a hollow task."""
+    return text.strip() in _TEMPLATE_GOALS
 
 
 def _looks_like_prose(text: str) -> bool:

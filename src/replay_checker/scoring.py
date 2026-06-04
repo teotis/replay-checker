@@ -8,6 +8,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from .yaml_lite import coerce_bool_int, parse_yaml_file
+
 
 class EvidenceGate(str, Enum):
     """Evidence validity gate identifiers."""
@@ -161,117 +163,13 @@ def parse_rubric(path: Path) -> dict[str, Any]:
     gates (optional), and ceilings (optional) sections.
     Handles scalars, string lists, and one level of nested dicts.
     """
-    data: dict[str, Any] = {}
-    current_list: str | None = None
-    current_section: str | None = None
-    current_subsection: str | None = None
-    sub_data: dict[str, Any] | None = None
-
-    for raw_line in Path(path).read_text(encoding="utf-8").splitlines():
-        line = raw_line.rstrip()
-        if not line or line.lstrip().startswith("#"):
-            continue
-
-        # "  - value" inside a list (top-level or inside a section)
-        if line.startswith("  - "):
-            if current_list and current_section is None:
-                # Top-level list (e.g. minimum_evidence in flat format)
-                data.setdefault(current_list, [])
-                assert isinstance(data[current_list], list)
-                data[current_list].append(line[4:])
-                continue
-            if current_section and current_subsection is None:
-                # List items under a top-level section (e.g. minimum_evidence:)
-                if data.get(current_section) is None or data[current_section] == {}:
-                    data[current_section] = []
-                if isinstance(data[current_section], list):
-                    data[current_section].append(line[4:])
-                    continue
-
-        # list item inside a nested section (e.g. "    - diff_present")
-        if line.strip().startswith("- ") and current_subsection is not None:
-            data.setdefault(current_section, {})
-            assert isinstance(data[current_section], dict)
-            if data[current_section].get(current_subsection) is None:
-                data[current_section][current_subsection] = []
-            if not isinstance(data[current_section][current_subsection], list):
-                # Subsection was already initialized as dict (nested keys), skip
-                continue
-            data[current_section][current_subsection].append(line.strip()[2:])
-            continue
-
-        # top-level "key:" or "key: value"
-        indent = len(raw_line) - len(raw_line.lstrip())
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        key = key.strip()
-        value = value.strip()
-
-        if indent == 0:
-            # Top-level key
-            current_list = None
-            current_section = None
-            current_subsection = None
-            sub_data = None
-            if value == "":
-                # Could be a section with nested dicts or a list;
-                # initialize as None, first child line determines type.
-                current_section = key
-                data[key] = None
-            elif value.startswith("[") and value.endswith("]"):
-                data[key] = [v.strip().strip('"') for v in value[1:-1].split(",") if v.strip()]
-            else:
-                try:
-                    data[key] = int(value)
-                except ValueError:
-                    data[key] = value
-        elif indent == 2 and current_section:
-            # Second-level key (e.g. "required:" or "no_diff:")
-            # Initialize section as dict if not already (was None from indent==0)
-            if data.get(current_section) is None:
-                data[current_section] = {}
-            if value == "":
-                current_subsection = key
-                # Placeholder; will be set to list if list items follow,
-                # or to dict if nested keys follow.
-                sub_data = None
-                data[current_section][key] = None
-            else:
-                current_subsection = None
-                sub_data = None
-                try:
-                    data[current_section][key] = int(value)
-                except ValueError:
-                    if value == "true":
-                        data[current_section][key] = True
-                    elif value == "false":
-                        data[current_section][key] = False
-                    else:
-                        data[current_section][key] = value
-        elif indent == 4 and current_subsection is not None:
-            # Third-level key (e.g. "result_ceiling: 0")
-            section_data = data.get(current_section, {})
-            current_val = section_data.get(current_subsection)
-            if current_val is None:
-                # Placeholder from indent==2: initialize as dict
-                sub_data = {}
-                data[current_section][current_subsection] = sub_data
-            elif isinstance(current_val, dict):
-                sub_data = current_val
-            else:
-                continue  # Already a list from list items; skip key-value parse
-            try:
-                sub_data[key] = int(value)
-            except ValueError:
-                if value == "true":
-                    sub_data[key] = True
-                elif value == "false":
-                    sub_data[key] = False
-                else:
-                    sub_data[key] = value
-
-    return data
+    data = parse_yaml_file(
+        path,
+        scalar_parser=coerce_bool_int,
+        parse_list_item_dicts=False,
+        parse_inline_lists=True,
+    )
+    return data if isinstance(data, dict) else {}
 
 
 # ---------------------------------------------------------------------------
@@ -430,3 +328,247 @@ def _check_oracle_leakage(
 
     for reason in reasons:
         evaluation.add_invalid(reason)
+
+
+# ---------------------------------------------------------------------------
+# Case provenance and source conflict detection
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SourceConflict:
+    """A single detected conflict between evidence sources."""
+
+    conflict_type: str
+    description: str
+    severity: str = "low"
+
+
+@dataclass
+class CaseProvenance:
+    """Provenance metadata for a case — scorer-facing trust and risk info.
+
+    This is downstream contract data, NOT execution-agent oracle evidence.
+    It tells scorers what sources built the case, how reliable they are,
+    and what conflicts were found during multi-source merge.
+    """
+
+    source_types: tuple[str, ...] = ()
+    primary_source_type: str = ""
+    base_commit_source: str = ""
+    base_commit_confidence: str = "low"
+    confidence: str = "medium"
+    candidate_score: float = 0.0
+    is_synthetic: bool = False
+    conflicts: tuple[SourceConflict, ...] = ()
+    risk_level: str = "low"
+    risk_reasons: tuple[str, ...] = ()
+
+    @property
+    def has_conflicts(self) -> bool:
+        return len(self.conflicts) > 0
+
+    @property
+    def is_low_confidence(self) -> bool:
+        return self.confidence == "low"
+
+
+def build_case_provenance(
+    *,
+    source_type: str,
+    base_source: str,
+    base_confidence: str,
+    candidate_score: float = 0.0,
+    is_synthetic: bool = False,
+    evidence_sources: tuple[str, ...] = (),
+    candidate_source_type: str = "",
+    merged_confidence: str = "medium",
+    merged_risk_level: str = "low",
+    merged_risk_reasons: tuple[str, ...] = (),
+    merged_source_agents: tuple[str, ...] = (),
+) -> CaseProvenance:
+    """Build a CaseProvenance from case metadata and merged candidate data.
+
+    Derives source_types from evidence_sources labels and candidate metadata.
+    Detects conflicts between plan/git/history sources.
+    """
+    source_types = _derive_source_types(
+        evidence_sources, source_type, candidate_source_type
+    )
+    conflicts = detect_source_conflicts(
+        source_type=source_type,
+        base_source=base_source,
+        base_confidence=base_confidence,
+        candidate_source_type=candidate_source_type,
+        evidence_sources=evidence_sources,
+        merged_confidence=merged_confidence,
+        merged_risk_reasons=merged_risk_reasons,
+    )
+    risk_level, risk_reasons = _compute_provenance_risk(
+        merged_risk_level=merged_risk_level,
+        merged_risk_reasons=merged_risk_reasons,
+        base_confidence=base_confidence,
+        conflicts=conflicts,
+        is_synthetic=is_synthetic,
+    )
+
+    return CaseProvenance(
+        source_types=source_types,
+        primary_source_type=candidate_source_type or source_type,
+        base_commit_source=base_source,
+        base_commit_confidence=base_confidence,
+        confidence=merged_confidence,
+        candidate_score=candidate_score,
+        is_synthetic=is_synthetic,
+        conflicts=tuple(conflicts),
+        risk_level=risk_level,
+        risk_reasons=tuple(risk_reasons),
+    )
+
+
+def detect_source_conflicts(
+    *,
+    source_type: str = "",
+    base_source: str = "",
+    base_confidence: str = "",
+    candidate_source_type: str = "",
+    evidence_sources: tuple[str, ...] = (),
+    merged_confidence: str = "medium",
+    merged_risk_reasons: tuple[str, ...] = (),
+) -> list[SourceConflict]:
+    """Detect conflicts between evidence sources used to build a case.
+
+    Checks for:
+    - Plan/git disagreement: plan doc exists but git history points elsewhere
+    - Low-confidence history evidence
+    - Missing/weak base commit source
+    - Single-source cases (no corroboration)
+    - Low merged confidence
+    """
+    conflicts: list[SourceConflict] = []
+
+    # Check for weak base commit
+    if base_confidence == "low" and base_source:
+        conflicts.append(SourceConflict(
+            conflict_type="weak_base_commit",
+            description=f"Base commit source '{base_source}' has low confidence",
+            severity="medium",
+        ))
+    if not base_source and source_type != "manual":
+        conflicts.append(SourceConflict(
+            conflict_type="missing_base_source",
+            description="No base commit source recorded",
+            severity="high",
+        ))
+
+    # Check for status-only / dependency-only history signals
+    for reason in merged_risk_reasons:
+        if "status-only" in reason:
+            conflicts.append(SourceConflict(
+                conflict_type="status_only_plan",
+                description="Plan doc is status/tracking only, may lack actionable tasks",
+                severity="medium",
+            ))
+        if "path-only" in reason:
+            conflicts.append(SourceConflict(
+                conflict_type="weak_history_signal",
+                description="History evidence is path-only mention with no task detail",
+                severity="medium",
+            ))
+        if "low-value" in reason:
+            conflicts.append(SourceConflict(
+                conflict_type="low_value_conversation",
+                description="History conversation is about dependency/lockfile maintenance",
+                severity="low",
+            ))
+
+    # Check if plan and history disagree on task signal
+    source_labels = " ".join(evidence_sources).lower()
+    has_plan = source_type in ("orchestration_kit", "handoff_plan") or "plan" in source_labels
+    has_history = any(t in source_labels for t in ("codex_history", "claude_history", "git_history"))
+
+    if has_plan and has_history and merged_confidence == "low":
+        conflicts.append(SourceConflict(
+            conflict_type="plan_history_disagreement",
+            description="Plan and history sources disagree on task signal (low merged confidence)",
+            severity="high",
+        ))
+
+    # Single-source cases are risky
+    if not has_plan and has_history and source_type == "git_history":
+        conflicts.append(SourceConflict(
+            conflict_type="history_only",
+            description="Case built from git history only — no plan or manual guidance",
+            severity="medium",
+        ))
+
+    # Low merged confidence is always a conflict
+    if merged_confidence == "low":
+        conflicts.append(SourceConflict(
+            conflict_type="low_confidence",
+            description="Low merged confidence across all evidence sources",
+            severity="high",
+        ))
+
+    return conflicts
+
+
+def _derive_source_types(
+    evidence_sources: tuple[str, ...],
+    source_type: str,
+    candidate_source_type: str,
+) -> tuple[str, ...]:
+    """Derive the set of source types that contributed to this case."""
+    types: set[str] = set()
+
+    # From evidence source labels
+    for label in evidence_sources:
+        label_lower = label.lower()
+        if "plan:" in label_lower and source_type not in ("git_history", "no_git", "empty_history"):
+            types.add("plan")
+        if "codex_history:" in label_lower:
+            types.add("codex_history")
+        if "claude_history:" in label_lower:
+            types.add("claude_history")
+
+    # From case metadata
+    if source_type in ("orchestration_kit", "handoff_plan"):
+        types.add("plan")
+    if source_type == "git_history":
+        types.add("git_history")
+    if source_type == "manual":
+        types.add("manual")
+
+    if candidate_source_type:
+        types.add(candidate_source_type)
+
+    if not types:
+        types.add(source_type or "unknown")
+
+    return tuple(sorted(types))
+
+
+def _compute_provenance_risk(
+    *,
+    merged_risk_level: str,
+    merged_risk_reasons: tuple[str, ...],
+    base_confidence: str,
+    conflicts: list[SourceConflict],
+    is_synthetic: bool,
+) -> tuple[str, tuple[str, ...]]:
+    """Compute overall risk for the provenance section."""
+    reasons: list[str] = list(merged_risk_reasons)
+
+    if is_synthetic:
+        reasons.append("synthetic case reconstructed from git history")
+    if base_confidence == "low":
+        reasons.append("low base commit confidence")
+
+    high_severity = [c for c in conflicts if c.severity == "high"]
+    if high_severity:
+        return "high", tuple(reasons)
+    if conflicts or merged_risk_level == "high":
+        return "medium", tuple(reasons)
+    if merged_risk_level == "medium" or reasons:
+        return "medium", tuple(reasons)
+    return "low", ()

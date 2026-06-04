@@ -1,0 +1,27 @@
+result_weight: 80
+process_weight: 20
+minimum_evidence:
+  - diff.patch
+  - completion_report.md
+  - evidence.yaml
+
+gates:
+  required:
+    - diff_present
+    - completion_report_present
+    - changed_files_present
+    - verification_cited
+    - reference_access_absent
+    - runner_identity_hidden
+
+ceilings:
+  no_diff:
+    result_ceiling: 0
+  no_completion_report:
+    process_ceiling: 0
+  no_verification:
+    verification_ceiling: 0
+  reference_leakage:
+    overall_invalid: true
+  runner_identity_exposed:
+    overall_invalid: true

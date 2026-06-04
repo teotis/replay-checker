@@ -3,16 +3,35 @@
 Provides the 3.0 user-facing entry point that lets users specify a project
 and natural-language case discovery scope. Generates a self-contained
 orchestration kit that external agents can execute to discover replayable cases.
+
+3.1 adds fast local preview (--dry-run) and deterministic local execution
+(--execute-local) that compile a case without generating a multi-agent kit.
 """
 
 from __future__ import annotations
 
-import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from .candidates import CandidateCase, build_case_candidates, select_case_candidate
 from .core import sanitize_slug
+from .discovery.models import DiscoveryPackage
+from .git_utils import git_output as shared_git_output
+from .orchestration import (
+    generate_agent_prompts,
+    generate_graph_tsv,
+    generate_package_doc,
+    generate_state_tsv,
+    generate_status_md,
+)
+from .sources import discover_evidence_sources
+
+_GIT_TIMEOUT = 10
+
+
+def _git_output(args: list[str], *, cwd: Path) -> str:
+    return shared_git_output(args, cwd=cwd, timeout=_GIT_TIMEOUT)
 
 
 @dataclass(frozen=True)
@@ -22,6 +41,24 @@ class WizardResult:
     scope: str
     plan_name: str
     start_command: str
+
+
+@dataclass(frozen=True)
+class WizardPreview:
+    """Read-only preview: no kit, no case, no filesystem writes."""
+    project_path: Path
+    scope: str
+    has_git: bool
+    git_clean: bool
+    head_commit: str
+    plan_count: int
+    history_count: int
+    candidate_count: int
+    top_candidate: CandidateCase | None
+    candidates: list[CandidateCase] = field(default_factory=list)
+    signals: list[str] = field(default_factory=list)
+    risks: list[str] = field(default_factory=list)
+    next_commands: list[str] = field(default_factory=list)
 
 
 def validate_project_path(project: str | Path) -> Path:
@@ -49,13 +86,8 @@ def generate_discovery_kit(
 ) -> WizardResult:
     """Generate a case discovery orchestration kit.
 
-    Args:
-        project_path: Path to the target project.
-        scope: Natural-language discovery scope.
-        output_root: Where to create the kit. Defaults to <project>/docs/plans/.
-
-    Returns:
-        WizardResult with kit path and metadata.
+    Delegates file generation to orchestration.py as the single source of truth,
+    then overlays wizard-specific customizations (INDEX.md, orchestrate.sh).
     """
     project = Path(project_path).resolve()
     scope_text = scope.strip()
@@ -70,29 +102,16 @@ def generate_discovery_kit(
 
     kit_root.mkdir(parents=True, exist_ok=True)
 
-    # Write INDEX.md
+    # Generate standard kit files via orchestration.py (single truth source).
+    packages = _wizard_packages(project)
+    _write_kit_files(kit_root, project, packages)
+
+    # Overlay wizard-specific customizations
     _write_index(kit_root, project, scope_text)
 
-    # Write launchers
     launchers = kit_root / "launchers"
     launchers.mkdir(parents=True, exist_ok=True)
-    _copy_orchestrate_sh(launchers)
-    _write_package_graph(kit_root, project, scope_text)
-    _write_agent_prompts(kit_root, project, scope_text)
-
-    # Write status directory
-    status = kit_root / "status"
-    status.mkdir(parents=True, exist_ok=True)
-    _write_initial_state(kit_root)
-    _write_status_files(kit_root)
-
-    # Write package definitions
-    packages = kit_root / "packages"
-    packages.mkdir(parents=True, exist_ok=True)
-    _write_plan_scan_package(packages, project, scope_text)
-    _write_git_discovery_package(packages, project, scope_text)
-    _write_merge_package(packages, project, scope_text)
-    _write_finalize_package(packages, project, scope_text)
+    _copy_orchestrate_sh(launchers, project)
 
     start_cmd = f"bash {kit_root / 'launchers' / 'orchestrate.sh'} start"
 
@@ -156,6 +175,88 @@ def wizard(
         print("Discovery kit is ready.")
 
     return result
+
+
+def wizard_preview(
+    project_path: str | Path,
+    scope: str = "",
+) -> WizardPreview:
+    """Fast local-only preview: discover signals, rank candidates, no filesystem writes.
+
+    Does not create worktrees, cases, runs, reports, or discovery kits.
+    Returns a WizardPreview with extractability signals and next-step recommendations.
+    """
+    project = validate_project_path(project_path)
+    scope_text = scope.strip()
+
+    has_git = (project / ".git").exists()
+    git_clean = True
+    head_commit = ""
+    if has_git:
+        status = _git_output(["status", "--porcelain"], cwd=project)
+        git_clean = not bool(status.strip())
+        head_commit = _git_output(["rev-parse", "--short", "HEAD"], cwd=project).strip()
+
+    records = discover_evidence_sources(project)
+    candidates = build_case_candidates(records, project_path=project)
+    top = select_case_candidate(candidates)
+
+    plan_count = sum(1 for r in records if r.source_type == "plan")
+    history_count = sum(1 for r in records if r.source_type in ("codex_history", "claude_history"))
+
+    signals: list[str] = []
+    risks: list[str] = []
+
+    if has_git:
+        signals.append("git repository detected")
+        if git_clean:
+            signals.append("working tree clean")
+        else:
+            risks.append("working tree is dirty — base commit inference may be less reliable")
+    else:
+        risks.append("no git repository — synthetic and base-commit features unavailable")
+
+    if plan_count:
+        signals.append(f"{plan_count} plan document(s) found")
+    else:
+        risks.append("no plan documents found under docs/plans/")
+
+    if history_count:
+        signals.append(f"{history_count} local history record(s) matched")
+    else:
+        signals.append("no local Codex/Claude history matches (may be normal for temp or new projects)")
+
+    if candidates:
+        signals.append(f"{len(candidates)} case candidate(s) ranked")
+    else:
+        risks.append("no case candidates could be built from available sources")
+
+    if top:
+        signals.append(f"top candidate: {top.candidate_id} (score={top.relevance_score:.3f}, {top.source_type})")
+        if top.risks:
+            risks.extend(top.risks)
+
+    next_commands = [
+        f"rtk python3 tools/replay.py wizard --project {project} --scope \"{scope_text or 'your scope here'}\"",
+        f"rtk python3 tools/replay.py intake --project {project}",
+        f"rtk python3 tools/replay.py wizard --project {project} --scope \"{scope_text or 'your scope here'}\" --execute-local --no-interactive",
+    ]
+
+    return WizardPreview(
+        project_path=project,
+        scope=scope_text,
+        has_git=has_git,
+        git_clean=git_clean,
+        head_commit=head_commit,
+        plan_count=plan_count,
+        history_count=history_count,
+        candidate_count=len(candidates),
+        top_candidate=top,
+        candidates=candidates,
+        signals=signals,
+        risks=risks,
+        next_commands=next_commands,
+    )
 
 
 def plan_case_discovery(
@@ -265,7 +366,7 @@ Forbidden without explicit user approval:
     (kit_root / "INDEX.md").write_text(text, encoding="utf-8")
 
 
-def _copy_orchestrate_sh(launchers: Path) -> None:
+def _copy_orchestrate_sh(launchers: Path, project: Path) -> None:
     """Copy the orchestrate.sh template into the kit.
 
     Looks for the template relative to this source file:
@@ -297,271 +398,148 @@ def _copy_orchestrate_sh(launchers: Path) -> None:
                 template_path = candidate
                 break
         else:
-            (launchers / "orchestrate.sh").write_text(
+            script = launchers / "orchestrate.sh"
+            script.write_text(
                 "#!/usr/bin/env bash\n# orchestrate.sh — generated by wizard\n"
                 "echo 'orchestrate.sh stub: copy a real template here'\n",
                 encoding="utf-8",
             )
+            script.chmod(0o755)
             return
-    shutil.copy2(template_path, launchers / "orchestrate.sh")
-    (launchers / "orchestrate.sh").chmod(0o755)
+    target = launchers / "orchestrate.sh"
+    shutil.copy2(template_path, target)
+    _patch_orchestrate_repo_root(target, project)
+    _patch_orchestrate_session_parser(target)
+    target.chmod(0o755)
 
 
-def _write_package_graph(kit_root: Path, project: Path, scope: str) -> None:
-    project_name = project.name
-    branch_prefix = f"agent/{project_name}-discovery"
-    lines = [
-        "package_id\tpackage_doc\tstatus_file\tdependencies\tdependency_type\twave\tbranch\tworktree\tmanual\tfinalize",
-        f"01-plan-scan\tpackages/01-plan-scan.md\tstatus/01-plan-scan.md\t\tstatus\t1\t{branch_prefix}/01-plan-scan\t.claude/worktrees/01-plan-scan\t0\t0",
-        f"02-git-discovery\tpackages/02-git-discovery.md\tstatus/02-git-discovery.md\t\tstatus\t1\t{branch_prefix}/02-git-discovery\t.claude/worktrees/02-git-discovery\t0\t0",
-        f"03-case-merge\tpackages/03-case-merge.md\tstatus/03-case-merge.md\t01-plan-scan,02-git-discovery\tstatus\t2\t{branch_prefix}/03-case-merge\t.claude/worktrees/03-case-merge\t0\t0",
-        f"99-finalize\tpackages/99-finalize.md\tstatus/99-finalize.md\t01-plan-scan,02-git-discovery,03-case-merge\tstatus+code\tfinal\t{branch_prefix}/99-finalize\t.claude/worktrees/99-finalize\t0\t1",
-    ]
-    (kit_root / "launchers" / "package-graph.tsv").write_text(
-        "\n".join(lines) + "\n", encoding="utf-8",
-    )
+def _shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
-def _write_agent_prompts(kit_root: Path, project: Path, scope: str) -> None:
-    project_name = project.name
-    text = f"""\
-# Agent Prompts — {project_name} Case Discovery
+def _patch_orchestrate_repo_root(script: Path, project: Path) -> None:
+    text = script.read_text(encoding="utf-8")
+    old = 'REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"'
+    new = f"REPO_ROOT={_shell_quote(project.as_posix())}"
+    if old in text:
+        script.write_text(text.replace(old, new), encoding="utf-8")
 
-Copy the prompt for the package you want to execute into your agent platform.
 
-## 01-plan-scan
-
-You are executing package `01-plan-scan` for the {project_name} case discovery.
-
-**Discovery scope**: {scope}
-
-Scan `{project}` for plan-based task sources (orchestration kits, handoff plans,
-planning docs with acceptance criteria). For each candidate, record:
-- Path to the plan document
-- Title and goal
-- Package count (if an orchestration kit)
-- Verification commands found
-- Whether it matches the discovery scope above
-
-Output a structured inventory in `inventory.md` at the kit root.
-
-## 02-git-discovery
-
-You are executing package `02-git-discovery` for the {project_name} case discovery.
-
-**Discovery scope**: {scope}
-
-Analyze git history in `{project}` to identify meaningful commits that could
-serve as synthetic replay case targets. Focus on commits that match or relate
-to the discovery scope above.
-
-Output a structured inventory in `git-candidates.md` at the kit root.
-
-## 03-case-merge
-
-You are executing package `03-case-merge` for the {project_name} case discovery.
-
-**Discovery scope**: {scope}
-
-Read the inventories produced by 01-plan-scan and 02-git-discovery. Merge
-overlapping candidates, rank by relevance to the scope, and output a final
-case list in `merged-candidates.md`.
-
-## 99-finalize
-
-You are executing package `99-finalize`.
-
-Read all completed package inventories, generate final cases using
-`replay.py intake` or `replay.py create-case`, run validation, and
-produce a completion report.
+def _patch_orchestrate_session_parser(script: Path) -> None:
+    text = script.read_text(encoding="utf-8")
+    old = """parse_session_id() {
+  awk '
+    /backgrounded/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "backgrounded" || $i == "·" || $i == "-" || $i == "•") continue
+        if ($i ~ /^[[:alnum:]_-]{6,}$/) {
+          print $i
+          exit
+        }
+      }
+    }
+  '
+}
 """
-    (kit_root / "launchers" / "agent-prompts.md").write_text(text, encoding="utf-8")
+    new = """parse_session_id() {
+  awk '
+    /backgrounded/ {
+      for (i = 1; i <= NF; i++) {
+        token = $i
+        gsub(/\\033\\[[0-9;]*[[:alpha:]]/, "", token)
+        if (token == "backgrounded" || token == "·" || token == "-" || token == "•") continue
+        if (token ~ /^[[:alnum:]_-]{6,}$/) {
+          print token
+          exit
+        }
+      }
+    }
+  '
+}
+"""
+    if old in text:
+        script.write_text(text.replace(old, new), encoding="utf-8")
 
 
-def _write_initial_state(kit_root: Path) -> None:
-    header = (
-        "package_id\tstate\tlaunched_at\tcompleted_at\tagent\tbranch\tworktree\t"
-        "base_commit\tcommit_hash\tverification\tintegration\tcleanup\t"
-        "last_error\tfailed_command\tconflict_files\tlog_summary\trecovery_hint"
+def _wizard_packages(project: Path) -> tuple[DiscoveryPackage, ...]:
+    """Build wizard-specific discovery packages.
+
+    Package IDs and descriptions are wizard-specific, but their structured
+    definition is passed to orchestration.py for file generation.
+    """
+    project_name = project.name
+    return (
+        DiscoveryPackage(
+            package_id="01-plan-scan",
+            description="Scan the target project for plan-based task sources.",
+            allowed_paths=(f"{project}/docs/", f"{project}/cases/"),
+            forbidden_paths=("_reference/",),
+            dependencies=(),
+            dependency_type="status",
+            wave=1,
+        ),
+        DiscoveryPackage(
+            package_id="02-git-discovery",
+            description="Identify meaningful git commits for synthetic replay case targets.",
+            allowed_paths=(f"{project}/.git/",),
+            forbidden_paths=("_reference/",),
+            dependencies=(),
+            dependency_type="status",
+            wave=1,
+        ),
+        DiscoveryPackage(
+            package_id="03-case-merge",
+            description="Merge plan and git candidates into a ranked final list.",
+            allowed_paths=(f"{project}/cases/",),
+            forbidden_paths=("_reference/",),
+            dependencies=("01-plan-scan", "02-git-discovery"),
+            dependency_type="status",
+            wave=2,
+        ),
+        DiscoveryPackage(
+            package_id="99-finalize",
+            description="Validate all generated cases, deduplicate, produce completion report.",
+            allowed_paths=(f"{project}/cases/",),
+            forbidden_paths=("_reference/",),
+            dependencies=("01-plan-scan", "02-git-discovery", "03-case-merge"),
+            dependency_type="status+code",
+            wave=0,
+            is_finalize=True,
+        ),
     )
-    packages = ["01-plan-scan", "02-git-discovery", "03-case-merge", "99-finalize"]
-    rows = [header]
+
+
+def _write_kit_files(
+    kit_root: Path,
+    project: Path,
+    packages: tuple[DiscoveryPackage, ...],
+) -> None:
+    """Generate standard kit files via orchestration.py as the single truth source."""
+    launchers = kit_root / "launchers"
+    status_dir = kit_root / "status"
+    packages_dir = kit_root / "packages"
+
+    for d in (launchers, status_dir, packages_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    (launchers / "package-graph.tsv").write_text(
+        generate_graph_tsv(packages, kit_root, project),
+        encoding="utf-8",
+    )
+    (launchers / "agent-prompts.md").write_text(
+        generate_agent_prompts(packages, kit_root),
+        encoding="utf-8",
+    )
+    (status_dir / "state.tsv").write_text(
+        generate_state_tsv(packages),
+        encoding="utf-8",
+    )
     for pkg in packages:
-        rows.append(f"{pkg}\tpending\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t")
-    (kit_root / "status" / "state.tsv").write_text("\n".join(rows) + "\n", encoding="utf-8")
-
-
-def _write_status_files(kit_root: Path) -> None:
-    """Write status/<package-id>.md for every package in the graph."""
-    package_ids = ["01-plan-scan", "02-git-discovery", "03-case-merge", "99-finalize"]
-    for pkg_id in package_ids:
-        md = (
-            f"# {pkg_id} Status\n"
-            "\n"
-            "## State\n"
-            "\n"
-            "`pending`\n"
-            "\n"
-            "## Evidence\n"
-            "\n"
-            "- Worktree:\n"
-            "- Branch:\n"
-            "- Base commit:\n"
-            "- Commit hash:\n"
-            "- Changed files:\n"
-            "- Verification:\n"
-            "\n"
-            "## Notes\n"
-            "\n"
-            "- Risks:\n"
-            "- Blockers:\n"
-            "- Recovery hint:\n"
+        (status_dir / f"{pkg.package_id}.md").write_text(
+            generate_status_md(pkg),
+            encoding="utf-8",
         )
-        (kit_root / "status" / f"{pkg_id}.md").write_text(md, encoding="utf-8")
-
-
-def _write_plan_scan_package(packages: Path, project: Path, scope: str) -> None:
-    text = f"""\
-# 01-plan-scan
-
-## Goal
-
-Scan the target project for plan-based task sources that match the discovery scope.
-
-**Discovery scope**: {scope}
-
-## Allowed Paths
-
-- `{project}/docs/` (read-only)
-- `{project}/cases/` (write)
-- Kit scratch directory
-
-## Required Work
-
-1. Scan `{project}/docs/plans/` for INDEX.md files (orchestration kits).
-2. Scan for markdown files containing "acceptance criteria" and ("goal" or "steps").
-3. Score each plan candidate by structural signals (packages, verification, git activity).
-4. Record all candidates in an inventory file.
-5. Highlight which candidates best match the discovery scope.
-
-## Acceptance Criteria
-
-- Inventory file lists all discovered plan sources with scores.
-- Each candidate includes path, title, package count, and relevance assessment.
-
-## Verification Commands
-
-- `ls {project}/docs/plans/` (should list plan directories)
-"""
-    (packages / "01-plan-scan.md").write_text(text, encoding="utf-8")
-
-
-def _write_git_discovery_package(packages: Path, project: Path, scope: str) -> None:
-    text = f"""\
-# 02-git-discovery
-
-## Goal
-
-Identify meaningful git commits in the target project that could serve as
-synthetic replay case targets, aligned with the discovery scope.
-
-**Discovery scope**: {scope}
-
-## Allowed Paths
-
-- `{project}/.git/` (read-only)
-- Kit scratch directory
-
-## Required Work
-
-1. Analyze git log for the target project.
-2. Filter out trivial commits (format, style, lint, bump, dependabot).
-3. Identify commits whose messages or file changes relate to the scope.
-4. For each candidate, record commit SHA, message, changed files, and relevance.
-5. Output a structured candidate list.
-
-## Acceptance Criteria
-
-- Candidate list includes commit SHA, message summary, changed files count.
-- Trivial commits are filtered out.
-- Candidates ranked by relevance to the scope.
-
-## Verification Commands
-
-- `git -C {project} log --oneline -5` (should show recent commits)
-"""
-    (packages / "02-git-discovery.md").write_text(text, encoding="utf-8")
-
-
-def _write_merge_package(packages: Path, project: Path, scope: str) -> None:
-    text = f"""\
-# 03-case-merge
-
-## Goal
-
-Merge plan-based and git-history case candidates into a ranked final list,
-deduplicating and scoring by relevance to the discovery scope.
-
-**Discovery scope**: {scope}
-
-## Allowed Paths
-
-- Kit root directory (read inventories, write merged output)
-- `{project}/cases/` (write final cases via replay.py)
-
-## Required Work
-
-1. Read `inventory.md` from 01-plan-scan.
-2. Read `git-candidates.md` from 02-git-discovery.
-3. Deduplicate overlapping candidates (same file/commit referenced by both).
-4. Rank all candidates by combined relevance score.
-5. Output `merged-candidates.md` with the final ranked list.
-6. Optionally generate cases using `replay.py intake` or `replay.py create-case`.
-
-## Acceptance Criteria
-
-- Merged list contains all unique candidates from both sources.
-- Candidates are ranked by relevance to the scope.
-- No duplicate entries for the same underlying source.
-
-## Verification Commands
-
-- Verify `merged-candidates.md` exists and is non-empty.
-"""
-    (packages / "03-case-merge.md").write_text(text, encoding="utf-8")
-
-
-def _write_finalize_package(packages: Path, project: Path, scope: str) -> None:
-    text = f"""\
-# 99-finalize
-
-## Goal
-
-Validate all generated cases, produce a completion report, and clean up.
-
-**Discovery scope**: {scope}
-
-## Allowed Paths
-
-- Kit root directory
-- `{project}/cases/` (read validation)
-
-## Required Work
-
-1. Run `python3 tools/replay.py` validation commands on generated cases.
-2. Produce `FINAL_REPORT.md` summarizing discovery results.
-3. Record final state in state.tsv.
-4. Verify no files in `{project}/` were modified.
-
-## Acceptance Criteria
-
-- All cases pass validation.
-- FINAL_REPORT.md exists and lists case count and source breakdown.
-- No modifications to the target project files.
-
-## Verification Commands
-
-- `python3 -m pytest tests/ -q` (replay_checker tests pass)
-- Verify no unexpected changes in `{project}/`
-"""
-    (packages / "99-finalize.md").write_text(text, encoding="utf-8")
+        (packages_dir / f"{pkg.package_id}.md").write_text(
+            generate_package_doc(pkg),
+            encoding="utf-8",
+        )

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
-import subprocess
+import shutil
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .core import sanitize_slug, stable_hash
+from .git_utils import git_output
 from .replay import _write_simple_yaml
 
 
@@ -139,15 +141,10 @@ def _discover_workspace_files(skill_dir: Path) -> list[str]:
 def _repo_base(repo: Path) -> tuple[str, str, str]:
     if not (repo / ".git").exists():
         return ("", "no_git", "low")
-    result = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode != 0:
+    output = git_output(["rev-parse", "HEAD"], cwd=repo)
+    if not output:
         return ("", "head_unavailable", "low")
-    return (result.stdout.strip(), "skill_repo_head", "high")
+    return (output.strip(), "skill_repo_head", "high")
 
 
 def _build_task_md(eval_case: SkillEvalCase) -> str:
@@ -186,6 +183,63 @@ def _build_evidence_sources_md(eval_case: SkillEvalCase) -> str:
         f"  - path: `{eval_case.evals_path}`",
         "",
     ])
+
+
+def dedupe_eval_cases(cases_root: str | Path, *, dry_run: bool = False) -> list[tuple[str, str]]:
+    """Remove duplicate eval cases, keeping the newest version per skill-eval group.
+
+    Two cases are duplicates if they share the same ``{skill_name}-eval{eval_id}``
+    prefix but differ in their trailing hash suffix (i.e. the prompt changed).
+
+    Returns a list of ``(kept_id, removed_id)`` pairs for audit.
+    """
+    root = Path(cases_root)
+    if not root.exists():
+        return []
+
+    # Group case dirs by their normalized prefix (without the trailing hash).
+    groups: dict[str, list[Path]] = defaultdict(list)
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        prefix = _eval_case_prefix(child.name)
+        if prefix:
+            groups[prefix].append(child)
+
+    removed: list[tuple[str, str]] = []
+    for prefix, dirs in groups.items():
+        if len(dirs) < 2:
+            continue
+        # Sort by directory mtime descending — newest first.
+        dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+        keep = dirs[0]
+        for obsolete in dirs[1:]:
+            kept_name = keep.name
+            removed_name = obsolete.name
+            if not dry_run:
+                shutil.rmtree(obsolete)
+            removed.append((kept_name, removed_name))
+
+    return removed
+
+
+def _eval_case_prefix(name: str) -> str | None:
+    """Extract the ``{skill}-eval{N}`` prefix from a case directory name.
+
+    Returns *None* when the name does not look like an eval case.
+    """
+    # Find the last `-` that separates the eval id from the trailing hash.
+    parts = name.rsplit("-", 1)
+    if len(parts) != 2:
+        return None
+    prefix, suffix = parts
+    # The suffix must look like a hex hash (at least 4 chars).
+    if len(suffix) < 4 or not all(c in "0123456789abcdef" for c in suffix):
+        return None
+    # The prefix must contain "-eval".
+    if "-eval" not in prefix:
+        return None
+    return prefix
 
 
 def _case_id(eval_case: SkillEvalCase) -> str:

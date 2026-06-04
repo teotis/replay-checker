@@ -80,7 +80,7 @@ class ExecutionPackageCompiler:
             ),
             output_contract=OutputContract(
                 modify_files_inside_workspace=self._workspace,
-                write_completion_report="completion_report.md in the run root",
+                write_completion_report="completion_report.md in the workspace root",
                 include_status_summary="status, summary, changed files, verification, and issues/notes",
             ),
             runner_instructions=self._build_runner_instructions(),
@@ -88,6 +88,12 @@ class ExecutionPackageCompiler:
         )
 
     def _build_goal(self) -> str:
+        extracted = _extract_goal_from_plan(self._plan_path)
+        if extracted:
+            return extracted
+        extracted = _extract_goal_from_case_task(self._case_task_path)
+        if extracted:
+            return extracted
         return "Replay a historical project situation and produce equivalent changes independently."
 
     def _build_starting_point(self) -> str:
@@ -103,7 +109,7 @@ class ExecutionPackageCompiler:
     def _build_expected_output(self) -> str:
         return (
             "A working workspace with file changes implementing the task.\n"
-            "A completed `completion_report.md` in the run root."
+            "A completed `completion_report.md` in the workspace root."
         )
 
     def _build_verification_contract(self) -> str:
@@ -221,7 +227,7 @@ class ExecutionPackageRenderer:
         return (
             "## Agent Output Contract\n"
             "- Modify files only inside the workspace.\n"
-            f"- Write `{pkg.output_contract.write_completion_report}` in the run root.\n"
+            f"- Write `{pkg.output_contract.write_completion_report}`.\n"
             f"- Include {pkg.output_contract.include_status_summary} in the report.\n"
         )
 
@@ -229,6 +235,7 @@ class ExecutionPackageRenderer:
         lines = [
             "## Evidence Requirements",
             "- A non-empty git diff in the workspace.",
+            "- Stage all changes (`git add -A`) before finishing so that new files appear in the diff.",
             "- A completed `completion_report.md`.",
             "- Verification command output or an explicit explanation if verification cannot run.",
         ]
@@ -269,3 +276,106 @@ def compile_execution_package(
         verification_commands=verification_commands,
     )
     return compiler.compile()
+
+
+def _extract_goal_from_plan(plan_path: str) -> str:
+    """Extract a concrete goal summary from a plan markdown file.
+
+    Priority order:
+    1. ## Title section (most common in orchestration-kit packages)
+    2. ## Goal / ## Task / ## Objective section
+    3. Document title (# heading)
+
+    Returns "" when the plan file is unreadable or empty.
+    """
+    from pathlib import Path
+
+    path = Path(plan_path)
+    if not path.is_file():
+        return ""
+
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+    if not text.strip():
+        return ""
+
+    lines = text.splitlines()
+
+    # Priority 1: ## Title section
+    title_text = _extract_section(lines, ("title", "标题"))
+    if title_text:
+        return title_text
+
+    # Priority 2: Explicit goal/task/objective section
+    goal_text = _extract_section(lines, ("goal", "task", "objective", "purpose", "概述", "目标", "任务"))
+    if goal_text:
+        return goal_text
+
+    # Priority 3: Document title
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("# ") and not stripped.startswith("## "):
+            title = stripped[2:].strip()
+            # Strip "Package: NN-" prefix if present
+            if title.startswith("Package:"):
+                title = title.split("-", 1)[-1].strip() if "-" in title else title[len("Package:"):].strip()
+            if len(title) >= 10:
+                return title
+            break
+
+    return ""
+
+
+def _extract_goal_from_case_task(case_task_path: str) -> str:
+    """Extract an execution-facing goal from a rendered case task."""
+    from pathlib import Path
+
+    path = Path(case_task_path)
+    if not path.is_file():
+        return ""
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return ""
+
+    goal = _extract_section(lines, ("goal", "objective", "reconstructed task"))
+    if goal:
+        return goal
+
+    for i, line in enumerate(lines):
+        if line.strip().lower() == "### objective":
+            parts: list[str] = []
+            for subsequent in lines[i + 1:]:
+                stripped = subsequent.strip()
+                if stripped.startswith("#"):
+                    break
+                if stripped:
+                    parts.append(stripped)
+                elif parts:
+                    break
+            return " ".join(parts)
+
+    return ""
+
+
+def _extract_section(lines: list[str], keywords: tuple[str, ...]) -> str:
+    """Extract the first paragraph body from a ## section matching any keyword."""
+    for i, line in enumerate(lines):
+        stripped = line.strip().lower()
+        if stripped.startswith("## ") and any(kw in stripped for kw in keywords):
+            parts: list[str] = []
+            for j in range(i + 1, len(lines)):
+                subsequent = lines[j].strip()
+                if subsequent.startswith("#"):
+                    break
+                if subsequent:
+                    parts.append(subsequent)
+                elif parts:
+                    break
+            if parts:
+                return " ".join(parts)
+            break
+    return ""

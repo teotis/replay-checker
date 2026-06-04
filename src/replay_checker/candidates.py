@@ -31,7 +31,7 @@ def build_case_candidates(
 
     Returns candidates ordered by relevance_score descending.
     """
-    scored = score_evidence_records(records) if not records or not records[0].relevance_score else records
+    scored = score_evidence_records(records, project_path=project_path) if not records or not records[0].relevance_score else records
     plan_records = [r for r in scored if r.source_type == "plan"]
     history_records = [r for r in scored if r.source_type in ("codex_history", "claude_history")]
 
@@ -81,6 +81,9 @@ def build_case_candidates(
             risks.append("conversation only mentions project path, no task detail")
         if best.task_signal == "conversation_low_value":
             risks.append("conversation is about dependency/lockfile changes")
+        alias_type = best.metadata.get("matched_alias_type", "")
+        if alias_type in ("basename", "normalized_name"):
+            risks.append(f"matched project only by {alias_type}, may be a different project")
         candidates.append(
             CandidateCase(
                 candidate_id=cid,

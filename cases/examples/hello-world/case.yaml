@@ -1,0 +1,14 @@
+id: hello-world
+project_path: ./
+plan_path: ""
+base_commit: HEAD
+base_source: manual
+title: "Hello World — 示例 Case"
+description: >
+  一个最简示例，展示 replay_checker case 的标准结构。
+  不包含任何真实项目数据，仅供学习 case 格式使用。
+difficulty: easy
+estimated_minutes: 5
+tags:
+  - example
+  - hello-world

@@ -240,7 +240,6 @@ LOCK_DIR="$PLAN_ROOT/status/.orchestrate.lock"
 MAX_PARALLEL="${ORCHESTRATION_MAX_PARALLEL:-10}"
 STATE_HEADER="package_id	state	launched_at	completed_at	agent	branch	worktree	base_commit	commit_hash	verification	integration	cleanup	last_error	failed_command	conflict_files	log_summary	recovery_hint"
 GRAPH_HEADER="package_id	package_doc	status_file	dependencies	dependency_type	wave	branch	worktree	manual	finalize"
-LOCK_ACQUIRED=0
 
 log() { printf '[orchestrate] %s\n' "$*" >&2; }
 die() { printf '[orchestrate] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -619,6 +618,44 @@ cmd_scratch_path() {
   printf '%s\n' "$path"
 }
 
+verify_scratch_files() {
+  local package_id="$1"
+  local scratch_dir file_count
+  scratch_dir="$(scratch_path_for "$package_id")"
+  if [ ! -d "$scratch_dir" ]; then
+    printf '%s scratch directory missing: %s\n' "$package_id" "$scratch_dir" >&2
+    return 1
+  fi
+  file_count="$(find "$scratch_dir" -type f ! -name '.gitignore' 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${file_count:-0}" -eq 0 ]; then
+    printf '%s scratch directory is empty: %s\n' "$package_id" "$scratch_dir" >&2
+    return 1
+  fi
+  return 0
+}
+
+cmd_verify_package() {
+  local package_id="${1:-}" id bad=0
+  [ -n "$package_id" ] || die "usage: verify-package <package-id>"
+  preflight_all
+  verify_scratch_files "$package_id" || bad=1
+  [ "$bad" -eq 0 ] && printf 'verify-package %s: ok\n' "$package_id"
+  return "$bad"
+}
+
+cmd_verify_finalize() {
+  local id bad=0
+  preflight_all
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    if ! verify_scratch_files "$id"; then
+      bad=1
+    fi
+  done < <(functional_package_ids)
+  [ "$bad" -eq 0 ] || die "verify-finalize: some packages have missing or empty scratch directories"
+  printf 'verify-finalize: ok\n'
+}
+
 usage() {
   cat <<USAGE
 Usage: bash launchers/orchestrate.sh <command>
@@ -627,6 +664,8 @@ Commands:
   status
   mark-state <package-id> <state> [options]
   scratch-path <package-id>
+  verify-package <package-id>
+  verify-finalize
 USAGE
 }
 
@@ -634,6 +673,8 @@ case "${1:-}" in
   status)   cmd_status ;;
   mark-state) shift; cmd_mark_state "$@" ;;
   scratch-path) shift; cmd_scratch_path "${1:-}" ;;
+  verify-package) shift; cmd_verify_package "${1:-}" ;;
+  verify-finalize) cmd_verify_finalize ;;
   *)        usage; exit 1 ;;
 esac
 '''

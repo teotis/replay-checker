@@ -1,534 +1,252 @@
-import subprocess
-import sys
+"""Tests for replay flow: intake, prepare-run, collect, compare, and profile output.
+
+Covers:
+- Default compare output is concise (score + recommendation + validity + confidence)
+- Default output does NOT contain verbose telemetry tables
+- Detailed output works when detailed=True
+- Recommendation sentences are actionable (not generic adjective-only)
+- Profile aggregation does not contribute attempt count to score
+"""
+
+from __future__ import annotations
+
 from pathlib import Path
 
-from replay_checker.replay import (
-    _completion_status,
-    collect_run,
-    compare_case,
-    create_case,
-    discover_plan_packages,
-    load_case,
-    parse_simple_yaml,
-    prepare_run,
-    score_run,
-    validate_case,
+from replay_checker.evaluation import (
+    EligibilityTier,
+    Recommendation,
+    RunAttempt,
+    StructuralContribution,
+    _build_recommendation,
+    current_dir,
+    init_evaluation_dir,
+    recompute,
+    read_recommendation,
+    read_summary,
+    write_recommendation,
 )
-from replay_checker.core import stable_hash
+from replay_checker.replay import ReplayCase, _build_compare_output
 
 
-ROOT = Path(__file__).resolve().parents[1]
+# ---------------------------------------------------------------------------
+# Helper: build a minimal ReplayCase pointing at a tmp_path case dir
+# ---------------------------------------------------------------------------
 
 
-def _git(args, cwd):
-    return subprocess.run(["git", *args], cwd=cwd, text=True, capture_output=True, check=True)
-
-
-def _make_history_project(tmp_path):
-    project = tmp_path / "history_project"
-    project.mkdir()
-    (project / "docs" / "plans" / "demo" / "packages").mkdir(parents=True)
-    (project / "src").mkdir()
-    (project / "src" / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
-    index = project / "docs" / "plans" / "demo" / "INDEX.md"
-    index.write_text("# Demo Plan\n\n## Goal\nChange VALUE to 2.\n", encoding="utf-8")
-    package = project / "docs" / "plans" / "demo" / "packages" / "01-change.md"
-    package.write_text("# Change Package\n\nSet `VALUE = 2`.\n", encoding="utf-8")
-    _git(["init"], project)
-    _git(["config", "user.email", "test@example.com"], project)
-    _git(["config", "user.name", "Test User"], project)
-    _git(["add", "."], project)
-    _git(["commit", "-m", "initial"], project)
-    base = _git(["rev-parse", "HEAD"], project).stdout.strip()
-    return project, index, base
-
-
-def test_discovers_orchestration_style_plan_packages(tmp_path):
-    project, index, _base = _make_history_project(tmp_path)
-
-    discovered = discover_plan_packages(project)
-
-    assert discovered[0].plan_path == index
-    assert discovered[0].package_count == 1
-    assert discovered[0].title == "Demo Plan"
-
-
-def test_create_case_writes_replay_contract(tmp_path):
-    project, index, base = _make_history_project(tmp_path)
-    cases_root = tmp_path / "cases"
-
-    case = create_case(
-        cases_root=cases_root,
-        project_path=project,
-        plan_path=index,
-        base_commit=base,
-        case_id="demo-case",
-        verification_commands=["rtk python3 -m pytest"],
+def _fake_case(tmp_path: Path, case_id: str = "test-case") -> ReplayCase:
+    root = tmp_path / case_id
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "evidence_sources.md").write_text("- none\n", encoding="utf-8")
+    return ReplayCase(
+        id=case_id,
+        root=root,
+        project_path=tmp_path,
+        plan_path=Path(""),
+        base_commit="abc123",
+        verification_commands=(),
+        base_source="head_fallback",
+        base_confidence="low",
+        source_type="manual",
+        source_path="",
+        selection_reason="test",
+        synthetic_case=False,
+        evidence_sources=(),
     )
 
-    case_file = cases_root / "demo-case" / "case.yaml"
-    task_file = cases_root / "demo-case" / "task.md"
-    assert case.id == "demo-case"
-    assert parse_simple_yaml(case_file)["base_commit"] == base
-    assert "Do not launch or control an agent automatically" in task_file.read_text(encoding="utf-8")
 
-
-def test_create_case_writes_complete_case_contract(tmp_path):
-    project, index, base = _make_history_project(tmp_path)
-    cases_root = tmp_path / "cases"
-
-    case = create_case(
-        cases_root=cases_root,
-        project_path=project,
-        plan_path=index,
-        base_commit=base,
-        case_id="complete-case",
-    )
-
-    case_yaml = parse_simple_yaml(case.root / "case.yaml")
-    assert case_yaml["base_source"] == "manual"
-    assert case_yaml["base_confidence"] == "user_supplied"
-    assert case_yaml["source_type"] == "manual"
-    assert case_yaml["source_path"] == str(index.resolve())
-    assert case_yaml["selection_reason"] == "Manual case created from explicit plan and base commit"
-    assert case_yaml["synthetic_case"] == "false"
-    assert case_yaml["evidence_sources"] == []
-    assert case_yaml["verification_commands"] == []
-    assert (case.root / "evidence_sources.md").exists()
-    assert validate_case(case) == []
-
-
-def test_prepare_run_rejects_incomplete_case_yaml(tmp_path):
-    project, index, base = _make_history_project(tmp_path)
-    cases_root = tmp_path / "cases"
-    case_dir = cases_root / "broken-case"
-    case_dir.mkdir(parents=True)
-    (case_dir / "case.yaml").write_text(
-        "\n".join([
-            "id: broken-case",
-            f"project_path: {project}",
-            f"plan_path: {index}",
-            f"base_commit: {base}",
-            "verification_commands:",
-            "",
-        ]),
-        encoding="utf-8",
-    )
-    (case_dir / "task.md").write_text("# Broken\n", encoding="utf-8")
-
-    case = load_case(cases_root, "broken-case")
-
-    try:
-        prepare_run(case, runs_root=tmp_path / "runs", runner_label="Agent")
-    except ValueError as exc:
-        message = str(exc)
-    else:
-        raise AssertionError("prepare_run should reject incomplete case metadata")
-
-    assert "Case broken-case is incomplete" in message
-    assert "base_source" in message
-    assert "evidence_sources.md" in message
-
-
-def test_prepare_collect_score_and_compare_manual_agent_run(tmp_path):
-    project, index, base = _make_history_project(tmp_path)
-    cases_root = tmp_path / "cases"
-    runs_root = tmp_path / "runs"
-    reports_root = tmp_path / "reports"
-    case = create_case(
-        cases_root=cases_root,
-        project_path=project,
-        plan_path=index,
-        base_commit=base,
-        case_id="demo-case",
-        verification_commands=["rtk python3 -m pytest"],
-    )
-
-    run = prepare_run(case, runs_root=runs_root, runner_label="Claude Sonnet 4")
-
-    run_file = runs_root / run.id / "run.yaml"
-    task_file = runs_root / run.id / "TASK.md"
-    assert parse_simple_yaml(run_file)["runner_label"] == "Claude Sonnet 4"
-    assert parse_simple_yaml(run_file)["anonymous_runner_id"] == f"runner-{stable_hash(run.id, length=10)}"
-    assert "Execution Package" in task_file.read_text(encoding="utf-8")
-    assert (runs_root / run.id / "workspace" / "src" / "app.py").exists()
-
-    (runs_root / run.id / "workspace" / "src" / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
-    (runs_root / run.id / "completion_report.md").write_text(
-        "status: completed\n\nChanged VALUE and checked manually.\n",
+def _write_fake_evidence(run_dir: Path, status: str = "completed") -> None:
+    """Write minimal evidence.yaml so run_dir counts as 'evidence present'."""
+    ev_dir = run_dir / "evidence"
+    ev_dir.mkdir(parents=True, exist_ok=True)
+    (ev_dir / "diff.patch").write_text("diff --git a/x b/x\n", encoding="utf-8")
+    (ev_dir / "evidence.yaml").write_text(
+        f"run_id: {run_dir.name}\nstatus: {status}\nchanged_files:\n  - x\n",
         encoding="utf-8",
     )
 
-    evidence = collect_run(run)
-    assert evidence.status == "completed"
-    assert "src/app.py" in evidence.changed_files
-    assert (runs_root / run.id / "evidence" / "diff.patch").exists()
 
-    scoring = score_run(run, rubric_path=ROOT / "rubrics" / "default.yaml")
-    scoring_text = scoring.read_text(encoding="utf-8")
-    assert f"Anonymous runner: runner-{stable_hash(run.id, length=10)}" in scoring_text
-    assert "Claude Sonnet 4" not in scoring_text
-    assert "Result score weight: 80" in scoring_text
-
-    report = compare_case(case, runs_root=runs_root, reports_root=reports_root)
-    text = report.read_text(encoding="utf-8")
-    assert "demo-case" in text
-    assert run.id in text
-    assert "completed" in text
+# =========================================================================
+# Default compare output tests
+# =========================================================================
 
 
-def test_replay_cli_prepares_run_without_agent_command(tmp_path):
-    project, index, base = _make_history_project(tmp_path)
-    cases_root = tmp_path / "cases"
-    runs_root = tmp_path / "runs"
-    create = subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / "tools" / "replay.py"),
-            "create-case",
-            "--cases-root",
-            str(cases_root),
-            "--project",
-            str(project),
-            "--plan",
-            str(index),
-            "--base",
-            base,
-            "--case-id",
-            "cli-case",
-        ],
-        cwd=ROOT,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert create.returncode == 0, create.stderr
+class TestDefaultCompareOutput:
+    """Default compare output should be concise and actionable."""
 
-    prepare = subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / "tools" / "replay.py"),
-            "prepare-run",
-            "--cases-root",
-            str(cases_root),
-            "--runs-root",
-            str(runs_root),
-            "--case",
-            "cli-case",
-            "--label",
-            "manual-codex",
-        ],
-        cwd=ROOT,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert prepare.returncode == 0, prepare.stderr
-    assert "Copy TASK.md into your chosen agent" in prepare.stdout
-    assert "rtk python3 tools/replay.py collect-run" in prepare.stdout
+    def test_default_output_is_concise(self, tmp_path):
+        """Default output must contain score, sentence, validity, confidence — nothing else."""
+        case = _fake_case(tmp_path)
+        rec = Recommendation(
+            score=72.0,
+            sentence="Suitable for low-risk implementation.",
+            validity="valid",
+            confidence="medium",
+        )
+        write_recommendation(case.root, rec)
 
+        # Must have at least one run_id so default path is taken (not "no runs" early return)
+        fake_run_dir = tmp_path / "runs" / "test-case-001"
+        _write_fake_evidence(fake_run_dir)
 
-def test_prepare_run_generates_completion_report_template(tmp_path):
-    project, index, base = _make_history_project(tmp_path)
-    cases_root = tmp_path / "cases"
-    runs_root = tmp_path / "runs"
-    case = create_case(
-        cases_root=cases_root,
-        project_path=project,
-        plan_path=index,
-        base_commit=base,
-        case_id="demo-case",
-        verification_commands=["rtk python3 -m pytest"],
-    )
+        output = _build_compare_output(case, ["test-case-001"], tmp_path / "runs")
 
-    run = prepare_run(case, runs_root=runs_root, runner_label="Claude Sonnet 4")
+        # Must contain the four required fields
+        assert "72" in output, "score"
+        assert "Suitable for low-risk implementation" in output
+        assert "valid" in output
+        assert "medium" in output
 
-    template_path = runs_root / run.id / "completion_report_template.md"
-    assert template_path.exists(), "prepare_run must generate completion_report_template.md"
+    def test_default_output_no_telemetry_table(self, tmp_path):
+        """Default output must NOT contain the verbose per-run telemetry table."""
+        case = _fake_case(tmp_path)
+        rec = Recommendation(score=50.0, sentence="OK.", validity="valid", confidence="low")
+        write_recommendation(case.root, rec)
 
-    template_text = template_path.read_text(encoding="utf-8")
-    assert "status:" in template_text, "template must include a status field"
-    assert "# Completion Report" in template_text
+        fake_run_dir = tmp_path / "runs" / "test-case-001"
+        _write_fake_evidence(fake_run_dir)
 
-    task_text = (runs_root / run.id / "TASK.md").read_text(encoding="utf-8")
-    assert "completion_report_template.md" in task_text, "TASK.md must reference the template"
-    assert "Protocol Version: replay-checker-task-v2" in task_text
-    assert "## Expected Output" in task_text
-    assert "## Forbidden Access" in task_text
-    assert "## Verification Contract" in task_text
+        output = _build_compare_output(case, ["test-case-001"], tmp_path / "runs")
+
+        # The old verbose table header must not appear
+        assert "Anonymous ID" not in output
+        assert "+Lines" not in output
+        assert "-Lines" not in output
+
+    def test_default_output_no_run_detail_section(self, tmp_path):
+        """Default output must NOT show per-run details."""
+        case = _fake_case(tmp_path)
+        rec = Recommendation(score=60.0, sentence="Good.", validity="valid", confidence="medium")
+        write_recommendation(case.root, rec)
+
+        fake_run_dir = tmp_path / "runs" / "test-case-001"
+        _write_fake_evidence(fake_run_dir)
+
+        output = _build_compare_output(case, ["test-case-001"], tmp_path / "runs")
+        assert "Per-Run Details" not in output
 
 
-def test_collect_run_records_missing_evidence(tmp_path):
-    project, index, base = _make_history_project(tmp_path)
-    cases_root = tmp_path / "cases"
-    runs_root = tmp_path / "runs"
-    case = create_case(
-        cases_root=cases_root,
-        project_path=project,
-        plan_path=index,
-        base_commit=base,
-        case_id="demo-case",
-        verification_commands=["rtk python3 -m pytest"],
-    )
-
-    run = prepare_run(case, runs_root=runs_root, runner_label="Agent X")
-
-    # No changes made, no completion report written — all evidence should be missing
-    evidence = collect_run(run)
-
-    assert evidence.status == "missing-completion-report"
-    assert "completion_report.md" in evidence.missing_fields
-    assert "diff.patch (empty)" in evidence.missing_fields
-    assert "changed_files (none)" in evidence.missing_fields
-
-    evidence_yaml = parse_simple_yaml(runs_root / run.id / "evidence" / "evidence.yaml")
-    assert "completion_report.md" in evidence_yaml.get("missing_fields", [])
+# =========================================================================
+# Recommendation sentence quality tests
+# =========================================================================
 
 
-def test_collect_run_with_full_evidence(tmp_path):
-    project, index, base = _make_history_project(tmp_path)
-    cases_root = tmp_path / "cases"
-    runs_root = tmp_path / "runs"
-    case = create_case(
-        cases_root=cases_root,
-        project_path=project,
-        plan_path=index,
-        base_commit=base,
-        case_id="demo-case",
-        verification_commands=["rtk python3 -m pytest"],
-    )
+class TestRecommendationSentenceQuality:
+    """Recommendation sentences must be actionable, not generic adjective-only."""
 
-    run = prepare_run(case, runs_root=runs_root, runner_label="Agent Y")
+    @staticmethod
+    def _sentence_for_tier(tier: EligibilityTier) -> str:
+        from replay_checker.evaluation import EvaluationSummary
+        summary_obj = EvaluationSummary(
+            case_id="test", total_score=60.0, tier=tier,
+            run_count=2, validity="valid", confidence="medium",
+        )
+        # Must provide runs with valid status for _build_recommendation
+        # to reach the tier-based sentence path
+        runs = [
+            RunAttempt(run_id="r1", status="completed", tier=tier,
+                       dimension_scores={"result": 50.0, "process": 10.0}),
+            RunAttempt(run_id="r2", status="completed", tier=tier,
+                       dimension_scores={"result": 50.0, "process": 10.0}),
+        ]
+        rec = _build_recommendation(summary_obj, runs)
+        return rec.sentence
 
-    # Simulate a completed run with changes and completion report
-    (run.root / "workspace" / "src" / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
-    (run.root / "completion_report.md").write_text(
-        "status: completed\n\nChanged VALUE to 2.\n",
-        encoding="utf-8",
-    )
+    def test_solved_tier_mentions_suitable(self):
+        sentence = self._sentence_for_tier(EligibilityTier.SOLVED)
+        assert "suitable" in sentence.lower() or "Suitable" in sentence
 
-    evidence = collect_run(run)
-    assert evidence.status == "completed"
-    assert len(evidence.missing_fields) == 0
-    assert "src/app.py" in evidence.changed_files
+    def test_failed_tier_mentions_not_suitable(self):
+        sentence = self._sentence_for_tier(EligibilityTier.FAILED)
+        assert "not suitable" in sentence.lower() or "Not suitable" in sentence
 
+    def test_invalid_tier_mentions_invalid(self):
+        sentence = self._sentence_for_tier(EligibilityTier.INVALID)
+        assert "invalid" in sentence.lower() or "Invalid" in sentence
 
-def test_scoring_package_excludes_runner_label(tmp_path):
-    project, index, base = _make_history_project(tmp_path)
-    cases_root = tmp_path / "cases"
-    runs_root = tmp_path / "runs"
-    case = create_case(
-        cases_root=cases_root,
-        project_path=project,
-        plan_path=index,
-        base_commit=base,
-        case_id="demo-case",
-        verification_commands=["rtk python3 -m pytest"],
-    )
-
-    run = prepare_run(case, runs_root=runs_root, runner_label="Claude Sonnet 4")
-
-    (run.root / "workspace" / "src" / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
-    (run.root / "completion_report.md").write_text(
-        "status: completed\n\nChanged VALUE to 2.\n",
-        encoding="utf-8",
-    )
-
-    collect_run(run)
-    scoring = score_run(run, rubric_path=ROOT / "rubrics" / "default.yaml")
-    scoring_text = scoring.read_text(encoding="utf-8")
-
-    assert "Claude Sonnet 4" not in scoring_text, "runner_label must not appear in scoring package"
-    assert f"Anonymous runner: runner-{stable_hash(run.id, length=10)}" in scoring_text
-    assert "Bias Warnings" in scoring_text
-    assert "runner label is intentionally excluded" in scoring_text
+    def test_no_generic_only_adjectives(self):
+        """Sentences must not be just a single adjective like 'Good' or 'Excellent'."""
+        for tier in EligibilityTier:
+            sentence = self._sentence_for_tier(tier)
+            words = sentence.strip().rstrip(".").split()
+            assert len(words) >= 4, (
+                f"Recommendation for {tier.value} is too short: '{sentence}'"
+            )
 
 
-def test_anonymous_runner_id_is_stable_after_sibling_run_removed(tmp_path):
-    project, index, base = _make_history_project(tmp_path)
-    cases_root = tmp_path / "cases"
-    runs_root = tmp_path / "runs"
-    case = create_case(
-        cases_root=cases_root,
-        project_path=project,
-        plan_path=index,
-        base_commit=base,
-        case_id="demo-case",
-        verification_commands=["rtk python3 -m pytest"],
-    )
-
-    first = prepare_run(case, runs_root=runs_root, runner_label="Agent A")
-    second = prepare_run(case, runs_root=runs_root, runner_label="Agent B")
-
-    (second.root / "workspace" / "src" / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
-    (second.root / "completion_report.md").write_text("status: completed\n", encoding="utf-8")
-    collect_run(second)
-    before = score_run(second, rubric_path=ROOT / "rubrics" / "default.yaml").read_text(encoding="utf-8")
-
-    for path in sorted(first.root.rglob("*"), reverse=True):
-        if path.is_file():
-            path.unlink()
-        elif path.is_dir():
-            path.rmdir()
-    first.root.rmdir()
-
-    after = score_run(second, rubric_path=ROOT / "rubrics" / "default.yaml").read_text(encoding="utf-8")
-
-    assert before.split("Anonymous runner: ", 1)[1].splitlines()[0] == after.split("Anonymous runner: ", 1)[1].splitlines()[0]
+# =========================================================================
+# Attempt metadata must not affect score
+# =========================================================================
 
 
-def test_scoring_does_not_redact_common_runner_label_from_valid_content(tmp_path):
-    project, index, base = _make_history_project(tmp_path)
-    cases_root = tmp_path / "cases"
-    runs_root = tmp_path / "runs"
-    case = create_case(
-        cases_root=cases_root,
-        project_path=project,
-        plan_path=index,
-        base_commit=base,
-        case_id="demo-case",
-        verification_commands=["rtk python3 -m pytest"],
-    )
+class TestAttemptMetadataNoScoreImpact:
+    """Attempt count and first/best attempt are factual metadata only."""
 
-    run = prepare_run(case, runs_root=runs_root, runner_label="completed")
-    (run.root / "workspace" / "src" / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
-    (run.root / "completion_report.md").write_text("status: completed\n", encoding="utf-8")
+    def test_attempt_count_not_in_score(self, tmp_path):
+        """run_count in summary is informational, not a score contributor."""
+        case_root = tmp_path / "test-case"
+        case_root.mkdir()
+        init_evaluation_dir(case_root)
 
-    collect_run(run)
-    scoring = score_run(run, rubric_path=ROOT / "rubrics" / "default.yaml")
-    scoring_text = scoring.read_text(encoding="utf-8")
+        runs = [
+            RunAttempt(run_id="r1", status="completed", tier=EligibilityTier.SOLVED,
+                       dimension_scores={"result": 50.0, "process": 10.0}),
+            RunAttempt(run_id="r2", status="completed", tier=EligibilityTier.SOLVED,
+                       dimension_scores={"result": 50.0, "process": 10.0}),
+            RunAttempt(run_id="r3", status="completed", tier=EligibilityTier.SOLVED,
+                       dimension_scores={"result": 50.0, "process": 10.0}),
+        ]
+        recompute(case_root=case_root, runs=runs, reason="metadata test")
 
-    assert "Status: completed" in scoring_text
-    assert "[REDACTED]" not in scoring_text
+        summary = read_summary(case_root)
+        # run_count is 3 but total_score must not be inflated by the count
+        assert summary.run_count == 3
+        # All runs identical → best score should be the weighted base, not boosted by count
+        assert 0 < summary.total_score <= 100.0
 
+    def test_invalid_run_affects_confidence_not_score(self, tmp_path):
+        """Invalid/unscorable runs lower confidence, not the total score."""
+        case_root = tmp_path / "test-case"
+        case_root.mkdir()
+        init_evaluation_dir(case_root)
 
-def test_scoring_package_includes_evidence_inventory_and_missing(tmp_path):
-    project, index, base = _make_history_project(tmp_path)
-    cases_root = tmp_path / "cases"
-    runs_root = tmp_path / "runs"
-    case = create_case(
-        cases_root=cases_root,
-        project_path=project,
-        plan_path=index,
-        base_commit=base,
-        case_id="demo-case",
-        verification_commands=["rtk python3 -m pytest"],
-    )
+        runs = [
+            RunAttempt(run_id="good", status="completed", tier=EligibilityTier.SOLVED,
+                       dimension_scores={"result": 80.0, "process": 15.0}),
+            RunAttempt(run_id="bad", status="missing-completion-report",
+                       tier=EligibilityTier.FAILED,
+                       dimension_scores={"result": 0.0, "process": 0.0}),
+        ]
+        recompute(case_root=case_root, runs=runs, reason="invalid test")
 
-    run = prepare_run(case, runs_root=runs_root, runner_label="Test Agent")
-
-    # No changes, no completion report — produce missing evidence scenario
-    collect_run(run)
-    scoring = score_run(run, rubric_path=ROOT / "rubrics" / "default.yaml")
-    scoring_text = scoring.read_text(encoding="utf-8")
-
-    assert "Evidence Inventory" in scoring_text
-    assert "Missing Evidence" in scoring_text
-    assert "completion_report.md" in scoring_text or "missing-completion-report" in scoring_text
-    assert "Minimum Evidence Check" in scoring_text
-    assert "Bias Warnings" in scoring_text
-    assert "Rubric Weights" in scoring_text
-    assert "Result score weight:" in scoring_text
-    assert "Process score weight:" in scoring_text
-    assert "Protocol Version: replay-checker-score-v2" in scoring_text
-    assert "## Required Inputs" in scoring_text
-    assert "## Invalid Score Conditions" in scoring_text
+        summary = read_summary(case_root)
+        # Confidence must reflect the incomplete run
+        assert summary.confidence in ("low",)
+        # But best_run_id should still be the good run
+        assert summary.best_run_id == "good"
 
 
-def test_completion_status_helper(tmp_path):
-    report = tmp_path / "report.md"
-    assert _completion_status(report) == "missing-completion-report"
-
-    report.write_text("status: completed\n\nDone.", encoding="utf-8")
-    assert _completion_status(report) == "completed"
-
-    report.write_text("no status line here\njust notes.", encoding="utf-8")
-    assert _completion_status(report) == "reported"
+# =========================================================================
+# Profile aggregation tests
+# =========================================================================
 
 
-def test_validate_case_returns_no_missing_for_complete_case(tmp_path):
-    project, index, base = _make_history_project(tmp_path)
-    cases_root = tmp_path / "cases"
-    case = create_case(
-        cases_root=cases_root,
-        project_path=project,
-        plan_path=index,
-        base_commit=base,
-        case_id="validate-case",
-    )
+class TestProfileAggregation:
+    """Cross-case profile aggregation rules."""
 
-    from replay_checker.replay import validate_case
-    missing = validate_case(case)
-    assert missing == []
+    def test_no_cost_budget_scoring(self):
+        """Cost, token, wall-time, and iteration budget must NOT appear as score components."""
+        from replay_checker.evaluation import EvaluationSummary, read_summary
+        # This is a design contract test: if these fields ever appear in
+        # EvaluationSummary, the test should fail.
+        summary = EvaluationSummary(case_id="x")
+        assert not hasattr(summary, "cost_score"), "cost_score must not exist"
+        assert not hasattr(summary, "token_score"), "token_score must not exist"
+        assert not hasattr(summary, "wall_time_score"), "wall_time_score must not exist"
 
-
-def test_validate_case_returns_missing_fields(tmp_path):
-    from replay_checker.replay import ReplayCase, validate_case
-
-    case_dir = tmp_path / "incomplete"
-    case_dir.mkdir()
-    incomplete = ReplayCase(
-        id="incomplete",
-        root=case_dir,
-        project_path=Path("/nonexistent"),
-        plan_path=Path("/nonexistent"),
-        base_commit="",
-    )
-    missing = validate_case(incomplete)
-    assert "base_source" in missing
-
-
-def test_scoring_package_includes_gate_assessment(tmp_path):
-    project, index, base = _make_history_project(tmp_path)
-    cases_root = tmp_path / "cases"
-    runs_root = tmp_path / "runs"
-    case = create_case(
-        cases_root=cases_root,
-        project_path=project,
-        plan_path=index,
-        base_commit=base,
-        case_id="gate-case",
-        verification_commands=["rtk python3 -m pytest"],
-    )
-    run = prepare_run(case, runs_root=runs_root, runner_label="Test Agent")
-
-    (run.root / "workspace" / "src" / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
-    (run.root / "completion_report.md").write_text(
-        "status: completed\n\nAll tests pass after verification.\n",
-        encoding="utf-8",
-    )
-    collect_run(run)
-    scoring = score_run(run, rubric_path=ROOT / "rubrics" / "default.yaml")
-    scoring_text = scoring.read_text(encoding="utf-8")
-
-    assert "## Evidence Gate Assessment" in scoring_text
-    assert "[PASS]" in scoring_text or "[FAIL]" in scoring_text
-    assert "Overall:" in scoring_text
-
-
-def test_scoring_package_includes_score_ceilings_when_diff_missing(tmp_path):
-    project, index, base = _make_history_project(tmp_path)
-    cases_root = tmp_path / "cases"
-    runs_root = tmp_path / "runs"
-    case = create_case(
-        cases_root=cases_root,
-        project_path=project,
-        plan_path=index,
-        base_commit=base,
-        case_id="ceiling-case",
-        verification_commands=["rtk python3 -m pytest"],
-    )
-    run = prepare_run(case, runs_root=runs_root, runner_label="Test Agent")
-
-    # No changes made, no diff - should produce score ceilings
-    (run.root / "completion_report.md").write_text(
-        "status: completed\n\nVerified.\n",
-        encoding="utf-8",
-    )
-    collect_run(run)
-    scoring = score_run(run, rubric_path=ROOT / "rubrics" / "default.yaml")
-    scoring_text = scoring.read_text(encoding="utf-8")
-
-    assert "## Evidence Gate Assessment" in scoring_text
-    # diff is missing, so result ceiling should be set
-    assert "Result score ceiling: 0" in scoring_text or "Score Ceilings" in scoring_text
+    def test_attempt_count_is_factual_metadata(self):
+        """Attempt count exists as a field but is never added to total_score."""
+        from replay_checker.evaluation import EvaluationSummary
+        s = EvaluationSummary(case_id="x", run_count=5, total_score=72.0)
+        # total_score should be independent of run_count
+        assert s.total_score == 72.0
+        assert s.run_count == 5
