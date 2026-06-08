@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from .core import atomic_write_json, atomic_write_text, read_json
+from .core import Diagnostic, atomic_write_json, atomic_write_text, read_json
 
 
 def now_iso() -> str:
@@ -83,39 +83,36 @@ class Manifest:
         return cls.from_dict(read_json(target))
 
 
-@dataclass(frozen=True)
-class QCIssue:
-    severity: str = "error"
-    check: str = ""
-    detail: str = ""
+# QCIssue is a type alias for backward compatibility.
+QCIssue = Diagnostic
 
 
 @dataclass
 class QCResult:
     checks_run: list[str] = field(default_factory=list)
-    issues: list[QCIssue] = field(default_factory=list)
+    issues: list[Diagnostic] = field(default_factory=list)
 
     @property
     def passed(self) -> bool:
         return not self.errors
 
     @property
-    def errors(self) -> list[QCIssue]:
-        return [issue for issue in self.issues if issue.severity == "error"]
+    def errors(self) -> list[Diagnostic]:
+        return [d for d in self.issues if d.severity == "error"]
 
     @property
-    def warnings(self) -> list[QCIssue]:
-        return [issue for issue in self.issues if issue.severity == "warning"]
+    def warnings(self) -> list[Diagnostic]:
+        return [d for d in self.issues if d.severity == "warning"]
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "passed": self.passed,
             "checks_run": self.checks_run,
-            "issues": [dataclasses.asdict(issue) for issue in self.issues],
+            "issues": [{"severity": d.severity, "code": d.code, "message": d.message} for d in self.issues],
         }
 
 
-Check = Callable[[Any], Iterable[QCIssue]]
+Check = Callable[[Any], Iterable[Diagnostic]]
 
 
 def run_qc(target: Any, checks: Iterable[tuple[str, Check]]) -> QCResult:
@@ -125,5 +122,5 @@ def run_qc(target: Any, checks: Iterable[tuple[str, Check]]) -> QCResult:
         try:
             result.issues.extend(check(target))
         except Exception as exc:
-            result.issues.append(QCIssue("error", name, f"QC check raised {type(exc).__name__}: {exc}"))
+            result.issues.append(Diagnostic("error", name, f"QC check raised {type(exc).__name__}: {exc}"))
     return result

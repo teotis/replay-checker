@@ -8,6 +8,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from .core import Diagnostic
 from .yaml_lite import coerce_bool_int, parse_yaml_file
 
 
@@ -45,6 +46,21 @@ class GateEvaluation:
         self.is_invalid = True
         self.invalid_reasons.append(reason)
 
+    def to_diagnostics(self) -> list[Diagnostic]:
+        """Convert gate evaluation to unified Diagnostic list."""
+        diagnostics: list[Diagnostic] = []
+        for result in self.results:
+            severity = "info" if result.passed else "error"
+            detail = f" — {result.detail}" if result.detail else ""
+            diagnostics.append(Diagnostic(
+                severity,
+                f"evidence_gate.{result.gate.value}",
+                f"[{'PASS' if result.passed else 'FAIL'}] {result.gate.value}{detail}",
+            ))
+        for reason in self.invalid_reasons:
+            diagnostics.append(Diagnostic("error", "evidence_gate.invalid", reason))
+        return diagnostics
+
 
 @dataclass
 class ScoreCeilings:
@@ -81,22 +97,25 @@ def evaluate_evidence_gates(
     diff_path = evidence_dir / "diff.patch"
     completion_path = evidence_root / "completion_report.md"
     evidence_yaml_path = evidence_dir / "evidence.yaml"
+    completion_text = _read_text_if_exists(completion_path)
+    evidence_yaml_text = _read_text_if_exists(evidence_yaml_path)
 
     evaluation.add(_check_diff_present(diff_path))
     evaluation.add(_check_completion_report_present(completion_path))
     evaluation.add(_check_changed_files_present(changed_files))
-    evaluation.add(_check_verification_cited(completion_path, evidence_yaml_path))
-    evaluation.add(_check_reference_access_absent(evidence_root, completion_path))
+    evaluation.add(_check_verification_cited(completion_text, evidence_yaml_text))
+    evaluation.add(_check_reference_access_absent(evidence_root, completion_text))
     evaluation.add(
         _check_runner_identity_hidden(
             evidence_root,
-            evidence_yaml_path,
+            evidence_yaml_text,
+            completion_text,
             run_id=run_id,
             runner_label=runner_label,
         )
     )
 
-    _check_oracle_leakage(evaluation, evidence_root, completion_path)
+    _check_oracle_leakage(evaluation, evidence_root, completion_text)
 
     return evaluation
 
@@ -195,6 +214,12 @@ def _check_completion_report_present(completion_path: Path) -> GateResult:
     )
 
 
+def _read_text_if_exists(path: Path) -> str:
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+
 def _check_changed_files_present(changed_files: list[str]) -> GateResult:
     has_files = bool(changed_files)
     return GateResult(
@@ -205,14 +230,13 @@ def _check_changed_files_present(changed_files: list[str]) -> GateResult:
 
 
 def _check_verification_cited(
-    completion_path: Path, evidence_yaml_path: Path
+    completion_text: str, evidence_yaml_text: str
 ) -> GateResult:
     """Check that verification steps are mentioned in completion report or evidence."""
-    if completion_path.exists():
-        text = completion_path.read_text(encoding="utf-8", errors="ignore")
+    if completion_text:
         if re.search(
             r"(verify|verification|test|pytest|make\s+test|check|pass|assert)",
-            text,
+            completion_text,
             re.IGNORECASE,
         ):
             return GateResult(
@@ -220,11 +244,10 @@ def _check_verification_cited(
                 passed=True,
             )
 
-    if evidence_yaml_path.exists():
-        text = evidence_yaml_path.read_text(encoding="utf-8", errors="ignore")
+    if evidence_yaml_text:
         if re.search(
             r"(verify|verification|test|pytest|pass)",
-            text,
+            evidence_yaml_text,
             re.IGNORECASE,
         ):
             return GateResult(
@@ -240,7 +263,7 @@ def _check_verification_cited(
 
 
 def _check_reference_access_absent(
-    evidence_root: Path, completion_path: Path
+    evidence_root: Path, completion_text: str
 ) -> GateResult:
     """Detect if the run accessed _reference/ or oracle material."""
     ref_dir = evidence_root / "_reference"
@@ -251,9 +274,8 @@ def _check_reference_access_absent(
             detail="_reference/ directory exists in run",
         )
 
-    if completion_path.exists():
-        text = completion_path.read_text(encoding="utf-8", errors="ignore")
-        if "_reference" in text or "oracle" in text.lower():
+    if completion_text:
+        if "_reference" in completion_text or "oracle" in completion_text.lower():
             return GateResult(
                 gate=EvidenceGate.REFERENCE_ACCESS_ABSENT,
                 passed=False,
@@ -268,7 +290,8 @@ def _check_reference_access_absent(
 
 def _check_runner_identity_hidden(
     evidence_root: Path,
-    evidence_yaml_path: Path,
+    evidence_yaml_text: str,
+    completion_text: str,
     *,
     run_id: str | None = None,
     runner_label: str | None = None,
@@ -281,7 +304,14 @@ def _check_runner_identity_hidden(
         )
 
     evidence_dir = evidence_root / "evidence"
-    for path in (evidence_dir / "evidence.yaml", evidence_root / "run.yaml"):
+    if runner_label and runner_label in evidence_yaml_text:
+        return GateResult(
+            gate=EvidenceGate.RUNNER_IDENTITY_HIDDEN,
+            passed=False,
+            detail=f"runner label '{runner_label}' found in evidence.yaml",
+        )
+
+    for path in (evidence_root / "run.yaml",):
         if path.exists():
             text = path.read_text(encoding="utf-8", errors="ignore")
             if runner_label and runner_label in text:
@@ -291,15 +321,13 @@ def _check_runner_identity_hidden(
                     detail=f"runner label '{runner_label}' found in {path.name}",
                 )
 
-    if completion_path := evidence_root / "completion_report.md":
-        if completion_path.exists():
-            text = completion_path.read_text(encoding="utf-8", errors="ignore")
-            if runner_label and runner_label in text:
-                return GateResult(
-                    gate=EvidenceGate.RUNNER_IDENTITY_HIDDEN,
-                    passed=False,
-                    detail=f"runner label '{runner_label}' found in completion_report.md",
-                )
+    completion_path = evidence_root / "completion_report.md"
+    if runner_label and runner_label in completion_text:
+        return GateResult(
+            gate=EvidenceGate.RUNNER_IDENTITY_HIDDEN,
+            passed=False,
+            detail=f"runner label '{runner_label}' found in {completion_path.name}",
+        )
 
     return GateResult(
         gate=EvidenceGate.RUNNER_IDENTITY_HIDDEN,
@@ -310,7 +338,7 @@ def _check_runner_identity_hidden(
 def _check_oracle_leakage(
     evaluation: GateEvaluation,
     evidence_root: Path,
-    completion_path: Path,
+    completion_text: str,
 ) -> None:
     """Mark score invalid if reference/oracle material was accessed."""
     reasons: list[str] = []
@@ -319,9 +347,8 @@ def _check_oracle_leakage(
     if ref_dir.exists():
         reasons.append("_reference/ directory found in run evidence")
 
-    if completion_path.exists():
-        text = completion_path.read_text(encoding="utf-8", errors="ignore")
-        if re.search(r"\b(oracle|_reference)\b", text):
+    if completion_text:
+        if re.search(r"\b(oracle|_reference)\b", completion_text):
             reasons.append(
                 "reference to oracle or _reference found in completion report"
             )

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import replay_checker.evaluation as evaluation_module
 from replay_checker.evaluation import (
     ComparisonCandidate,
     ComparisonLabel,
@@ -432,6 +433,24 @@ def test_snapshot_current_overwrites_existing(tmp_path):
     assert snap_summary.total_score == 75.0
 
 
+def test_recompute_snapshot_timestamp_includes_subsecond_precision(tmp_path, monkeypatch):
+    case = tmp_path / "case-1"
+    init_evaluation_dir(case)
+    write_summary(case, EvaluationSummary(case_id="case-1", total_score=50.0))
+    timestamps: list[str] = []
+
+    def capture_snapshot(case_root: str | Path, timestamp: str) -> Path:
+        timestamps.append(timestamp)
+        return snapshots_dir(case_root) / timestamp
+
+    monkeypatch.setattr(evaluation_module, "snapshot_current", capture_snapshot)
+
+    recompute(case_root=case, runs=[_make_run("run-1", result=10.0)], reason="timestamp test")
+
+    assert timestamps
+    assert "." in timestamps[0]
+
+
 def read_summary_from_path(path: Path) -> EvaluationSummary:
     from replay_checker.evaluation import _from_yaml
     data = _from_yaml(path.read_text(encoding="utf-8"))
@@ -573,6 +592,32 @@ def test_recompute_single_run(tmp_path):
     history = read_score_history(case)
     assert len(history) == 1
     assert history[0].run_id == "run-1"
+
+
+def test_invalid_tier_run_cannot_be_best_when_valid_run_scores_zero(tmp_path):
+    case = tmp_path / "case-1"
+    runs = [
+        _make_run(
+            "invalid-first",
+            tier=EligibilityTier.INVALID,
+            status="invalid",
+            result=90.0,
+            process=20.0,
+        ),
+        _make_run(
+            "valid-zero",
+            tier=EligibilityTier.FAILED,
+            status="completed",
+            result=0.0,
+            process=0.0,
+        ),
+    ]
+
+    recompute(case_root=case, runs=runs, reason="invalid best regression")
+
+    summary = read_summary(case)
+    assert summary.best_run_id == "valid-zero"
+    assert summary.total_score == 0.0
 
 
 def test_recompute_multiple_runs_with_rankings(tmp_path):

@@ -31,7 +31,7 @@ def build_case_candidates(
 
     Returns candidates ordered by relevance_score descending.
     """
-    scored = score_evidence_records(records, project_path=project_path) if not records or not records[0].relevance_score else records
+    scored = records if _records_are_scored(records) else score_evidence_records(records, project_path=project_path)
     plan_records = [r for r in scored if r.source_type == "plan"]
     history_records = [r for r in scored if r.source_type in ("codex_history", "claude_history")]
 
@@ -99,6 +99,17 @@ def build_case_candidates(
 
     candidates.sort(key=lambda c: c.relevance_score, reverse=True)
     return candidates
+
+
+def _records_are_scored(records: list[EvidenceRecord]) -> bool:
+    if not records:
+        return False
+    return all(
+        record.relevance_score != 0.0
+        or bool(record.relevance_reasons)
+        or bool(record.task_signal)
+        for record in records
+    )
 
 
 def select_case_candidate(

@@ -3,12 +3,14 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .core import stable_hash
+from .case_paths import case_inventory_root, iter_case_dirs, resolve_case_dir
+from .core import Diagnostic, atomic_write_text, format_diagnostics, stable_hash
 from .candidates import CandidateCase, build_case_candidates, select_case_candidate
 from .evaluation import Recommendation, read_recommendation
 from .git_utils import DEFAULT_GIT_TIMEOUT, git_output, git_run
@@ -22,7 +24,7 @@ from .scoring import (
     parse_rubric,
 )
 from .sources import EvidenceRecord, EvidenceSourceConfig, discover_evidence_sources
-from .yaml_lite import coerce_nested_int, emit_yaml, parse_yaml_file
+from .yaml_lite import emit_yaml, parse_simple_yaml, parse_yaml_file
 
 _GIT_TIMEOUT = DEFAULT_GIT_TIMEOUT
 
@@ -35,6 +37,35 @@ FORBIDDEN_PATH_PATTERNS = (
 SUSPICIOUS_PATH_PATTERNS = (
     ".env", "credentials", "secret", "token", "password", "key",
 )
+SENSITIVE_UNTRACKED_FILENAMES = {
+    ".env",
+    ".env.local",
+    ".envrc",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+}
+SAFE_ENV_EXAMPLE_FILENAMES = {
+    ".env.example",
+    ".env.sample",
+    ".env.template",
+}
+SENSITIVE_UNTRACKED_SUFFIXES = (
+    ".key",
+    ".pem",
+    ".p12",
+    ".pfx",
+)
+SENSITIVE_UNTRACKED_SUBSTRINGS = (
+    "credential",
+    "secret",
+    "token",
+    "password",
+)
+IGNORED_UNTRACKED_FILENAMES = {
+    "completion_report.md",
+}
 
 
 def _git_run(
@@ -123,19 +154,19 @@ class RunHealth:
     reason: str
 
 
-def parse_simple_yaml(path: str | Path) -> dict[str, object]:
-    """Parse the tiny YAML subset this project writes: scalar keys, string lists, nested blocks."""
-    data = parse_yaml_file(
-        path,
-        scalar_parser=coerce_nested_int,
-        parse_list_item_dicts=False,
-    )
-    return data if isinstance(data, dict) else {}
+@dataclass(frozen=True)
+class IntakeConfig:
+    """Bundled parameters for replay case intake operations."""
+    project_path: Path
+    cases_root: Path
+    codex_history_roots: tuple[Path, ...] = ()
+    claude_history_roots: tuple[Path, ...] = ()
+    allow_duplicate: bool = False
 
 
 def _write_simple_yaml(path: Path, data: dict[str, object], *, indent: int = 0) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(emit_yaml(data, indent=indent) + "\n", encoding="utf-8")
+    atomic_write_text(path, emit_yaml(data, indent=indent) + "\n")
 
 
 def _first_heading(path: Path) -> str:
@@ -191,51 +222,26 @@ def _detect_all_sources(project_path: Path) -> list[tuple[int, str, Path, str]]:
 def _detect_source(project_path: Path) -> dict[str, object]:
     """Detect the best task source in a project.
 
-    Collects all plan candidates, scores them, and returns the highest-scoring one.
-    Falls back to git_history when no plan candidates are found.
+    Collects all plan candidates via ``_detect_all_sources``, scores them, and
+    returns the highest-scoring one.  Falls back to git_history when no plan
+    candidates are found.
 
     Returns a dict with keys: source_type, source_path, plan_path, title,
     selection_reason, verification_commands.
     """
-    plans_dir = project_path / "docs" / "plans"
+    candidates = _detect_all_sources(project_path)
 
-    if plans_dir.exists():
-        candidates: list[tuple[int, str, Path, str]] = []
-
-        # Collect INDEX.md candidates (orchestration kits)
-        for index in sorted(plans_dir.glob("**/INDEX.md")):
-            # Skip root INDEX.md (meta-index, not a kit)
-            if index.parent == plans_dir:
-                continue
-            candidate_dir = index.parent
-            score, reasons = _score_plan_candidate(candidate_dir, project_path)
-            candidates.append((score, reasons, index, "orchestration_kit"))
-
-        # Collect handoff plan candidates (non-INDEX.md with acceptance criteria)
-        seen_dirs = {idx.parent for _, _, idx, _ in candidates}
-        for md in sorted(plans_dir.glob("**/*.md")):
-            if md.parent in seen_dirs:
-                continue
-            text = md.read_text(encoding="utf-8", errors="ignore").lower()
-            if "acceptance criteria" in text and ("goal" in text or "steps" in text):
-                candidate_dir = md.parent
-                score, reasons = _score_plan_candidate(candidate_dir, project_path)
-                candidates.append((score, reasons, md, "handoff_plan"))
-
-        if candidates:
-            # Sort by score descending, then by path for determinism
-            candidates.sort(key=lambda x: (-x[0], str(x[2])))
-            best_score, best_reasons, best_path, best_type = candidates[0]
-
-            return {
-                "source_type": best_type,
-                "source_path": str(best_path),
-                "plan_path": str(best_path),
-                "title": _first_heading(best_path),
-                "selection_reason": f"Scored {best_score} ({best_reasons}) — {best_type}",
-                "verification_commands": _extract_verification(project_path, best_path.parent),
-                **_plan_source_metadata(project_path, best_path.parent),
-            }
+    if candidates:
+        best_score, best_reasons, best_path, best_type = candidates[0]
+        return {
+            "source_type": best_type,
+            "source_path": str(best_path),
+            "plan_path": str(best_path),
+            "title": _first_heading(best_path),
+            "selection_reason": f"Scored {best_score} ({best_reasons}) — {best_type}",
+            "verification_commands": _extract_verification(project_path, best_path.parent),
+            **_plan_source_metadata(project_path, best_path.parent),
+        }
 
     # No plan found — return signal for git history fallback
     return {
@@ -648,15 +654,17 @@ def _discover_case_evidence(
     *,
     codex_history_roots: tuple[str | Path, ...] | list[str | Path] | None = None,
     claude_history_roots: tuple[str | Path, ...] | list[str | Path] | None = None,
+    scan_warnings: list[str] | None = None,
 ) -> list[EvidenceRecord]:
     if codex_history_roots is None and claude_history_roots is None:
-        return discover_evidence_sources(project)
+        return discover_evidence_sources(project, warnings=scan_warnings)
     return discover_evidence_sources(
         project,
         EvidenceSourceConfig(
             codex_history_roots=tuple(Path(path) for path in (codex_history_roots or ())),
             claude_history_roots=tuple(Path(path) for path in (claude_history_roots or ())),
         ),
+        warnings=scan_warnings,
     )
 
 
@@ -664,7 +672,7 @@ def _evidence_record_label(record: EvidenceRecord) -> str:
     return f"{record.source_type}: {record.summary}"
 
 
-def _write_evidence_sources(case: ReplayCase, records: list[EvidenceRecord]) -> None:
+def _write_evidence_sources(case: ReplayCase, records: list[EvidenceRecord], *, scan_warnings: list[str] | None = None) -> None:
     lines = [
         f"# Evidence Sources: {case.id}",
         "",
@@ -673,9 +681,16 @@ def _write_evidence_sources(case: ReplayCase, records: list[EvidenceRecord]) -> 
     ]
     if not records:
         lines.append("- none")
-    for record in records:
+    for record in records[:_MAX_EVIDENCE_SOURCES]:
         lines.append(f"- `{record.source_type}` confidence={record.confidence}: {record.summary}")
         lines.append(f"  - path: `{record.path}`")
+    remaining = len(records) - _MAX_EVIDENCE_SOURCES
+    if remaining > 0:
+        lines.append(f"- ... {remaining} additional source(s) omitted (cap: {_MAX_EVIDENCE_SOURCES})")
+    if scan_warnings:
+        lines.extend(["", "## Scan Warnings", ""])
+        for w in scan_warnings:
+            lines.append(f"- {w}")
     (case.root / "evidence_sources.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -730,22 +745,19 @@ def _write_candidate_report(
 
 def intake(
     *,
-    cases_root: str | Path,
-    project_path: str | Path,
-    codex_history_roots: tuple[str | Path, ...] | list[str | Path] | None = None,
-    claude_history_roots: tuple[str | Path, ...] | list[str | Path] | None = None,
-    allow_duplicate: bool = False,
+    config: IntakeConfig,
     _force_source: dict[str, object] | None = None,
     _cached_evidence: list[EvidenceRecord] | None = None,
+    _scan_warnings: list[str] | None = None,
 ) -> ReplayCase:
     """Auto-generate a replay case from a project directory.
 
     Scans for orchestration kits, handoff plans, or falls back to git history.
     Builds evidence candidates, selects the best one, and writes candidate_report.md.
-    Checks for content-aware duplicates unless allow_duplicate is True.
+    Checks for content-aware duplicates unless config.allow_duplicate is True.
     """
-    project = Path(project_path).resolve()
-    cases = Path(cases_root)
+    project = config.project_path.resolve()
+    cases = Path(config.cases_root)
 
     source = _force_source if _force_source is not None else _detect_source(project)
 
@@ -759,7 +771,7 @@ def intake(
         source = {**source, "source_type": "empty_history", "selection_reason": "Git repository has no commits"}
 
     case_id = _generate_case_id(project, source)
-    case_dir = cases / case_id
+    case_dir = case_inventory_root(cases, project) / case_id
     case_dir.mkdir(parents=True, exist_ok=True)
 
     # A case is synthetic only when we actually found a meaningful target commit.
@@ -771,10 +783,12 @@ def intake(
     )
 
     # Discover evidence and build candidates
+    scan_warnings: list[str] = list(_scan_warnings) if _scan_warnings is not None else []
     evidence_records = _cached_evidence if _cached_evidence is not None else _discover_case_evidence(
         project,
-        codex_history_roots=codex_history_roots,
-        claude_history_roots=claude_history_roots,
+        codex_history_roots=config.codex_history_roots or None,
+        claude_history_roots=config.claude_history_roots or None,
+        scan_warnings=scan_warnings,
     )
     candidates = build_case_candidates(evidence_records, project_path=project)
     selected_candidate = select_case_candidate(candidates)
@@ -795,7 +809,7 @@ def intake(
         source_path=source["source_path"],
         selection_reason=source["selection_reason"],
         synthetic_case=is_synthetic,
-        evidence_sources=tuple(_evidence_record_label(record) for record in evidence_records),
+        evidence_sources=tuple(_evidence_record_label(record) for record in evidence_records[:_MAX_EVIDENCE_SOURCES]),
         selected_candidate_id=selected_candidate.candidate_id if selected_candidate else "",
         candidate_score=selected_candidate.relevance_score if selected_candidate else 0.0,
         candidate_source_type=selected_candidate.source_type if selected_candidate else "",
@@ -823,7 +837,7 @@ def intake(
         reconstruction_risk=reconstruction_risk,
         reconstruction_confidence=reconstruction_confidence,
     )
-    _write_evidence_sources(case, evidence_records)
+    _write_evidence_sources(case, evidence_records, scan_warnings=scan_warnings)
 
     _save_reference_evidence(case, project)
 
@@ -836,7 +850,7 @@ def intake(
     case, _dup_status = _apply_duplicate_check(
         case,
         cases,
-        allow_duplicate=allow_duplicate,
+        allow_duplicate=config.allow_duplicate,
         reconstruction_risk=reconstruction_risk,
         reconstruction_confidence=reconstruction_confidence,
     )
@@ -846,30 +860,28 @@ def intake(
 
 def batch_intake(
     *,
-    cases_root: str | Path,
-    project_path: str | Path,
+    config: IntakeConfig,
     min_score: int = 3,
     max_cases: int = 50,
-    codex_history_roots: tuple[str | Path, ...] | list[str | Path] | None = None,
-    claude_history_roots: tuple[str | Path, ...] | list[str | Path] | None = None,
-    allow_duplicate: bool = False,
 ) -> list[ReplayCase]:
     """Extract cases from all orchestration kits in a project.
 
     Scans all plan candidates, filters by minimum score, and creates a case
     for each qualifying kit.  Returns the list of created cases.
     """
-    project = Path(project_path).resolve()
+    project = config.project_path.resolve()
     all_sources = _detect_all_sources(project)
 
     if not all_sources:
         return []
 
     # Pre-compute evidence once (expensive I/O)
+    batch_scan_warnings: list[str] = []
     cached_evidence = _discover_case_evidence(
         project,
-        codex_history_roots=codex_history_roots,
-        claude_history_roots=claude_history_roots,
+        codex_history_roots=config.codex_history_roots or None,
+        claude_history_roots=config.claude_history_roots or None,
+        scan_warnings=batch_scan_warnings,
     )
 
     # Build force-source dicts for candidates that meet the threshold.
@@ -897,11 +909,10 @@ def batch_intake(
         expected_case_id = _generate_case_id(project, src)
         try:
             case = intake(
-                cases_root=cases_root,
-                project_path=project_path,
-                allow_duplicate=allow_duplicate,
+                config=config,
                 _force_source=src,
                 _cached_evidence=cached_evidence,
+                _scan_warnings=batch_scan_warnings,
             )
             if case.id in seen_case_ids:
                 continue
@@ -912,51 +923,54 @@ def batch_intake(
                 continue
             created.append(case)
             seen_case_ids.add(case.id)
-        except Exception:
+        except Exception as exc:
+            print(
+                f"warning: batch intake skipped {src.get('source_path', '<unknown>')}: {exc}",
+                file=sys.stderr,
+            )
             continue
 
     return created
 
 
-def _case_quality_gate_issues(case: ReplayCase) -> list[str]:
-    """Return blocking quality issues for batch-extracted cases."""
-    issues: list[str] = []
-    issues.extend(validate_case(case))
-    issues.extend(validate_case_task(case))
+def _case_quality_gate_issues(case: ReplayCase) -> list[Diagnostic]:
+    """Return blocking quality diagnostics for batch-extracted cases."""
+    diagnostics: list[Diagnostic] = []
+    diagnostics.extend(validate_case(case))
+    diagnostics.extend(validate_case_task(case))
 
     if not case.verification_commands:
-        issues.append("missing_verification_commands")
+        diagnostics.append(Diagnostic("error", "missing.verification_commands", "missing_verification_commands"))
 
     ref_dir = case.root / "_reference"
     diff_path = ref_dir / "diff.patch"
     if not diff_path.exists() or diff_path.stat().st_size == 0:
-        issues.append("missing_reference_diff")
+        diagnostics.append(Diagnostic("error", "missing.reference_diff", "missing_reference_diff"))
 
     metadata_path = ref_dir / "reference_metadata.yaml"
     metadata = parse_simple_yaml(metadata_path) if metadata_path.exists() else {}
     changed_files = metadata.get("changed_files") or []
     if not isinstance(changed_files, list) or not changed_files:
-        issues.append("missing_reference_changed_files")
+        diagnostics.append(Diagnostic("error", "missing.reference_changed_files", "missing_reference_changed_files"))
 
-    return issues
+    return diagnostics
 
 
 def create_case(
     *,
-    cases_root: str | Path,
-    project_path: str | Path,
+    config: IntakeConfig,
     plan_path: str | Path,
     base_commit: str,
     case_id: str,
     verification_commands: list[str] | tuple[str, ...] | None = None,
-    allow_duplicate: bool = False,
+    _scan_warnings: list[str] | None = None,
 ) -> ReplayCase:
-    root = Path(cases_root) / case_id
+    project = config.project_path.resolve()
+    root = case_inventory_root(config.cases_root, project) / case_id
     root.mkdir(parents=True, exist_ok=True)
-    project = Path(project_path).resolve()
     raw_plan = Path(plan_path)
     plan = raw_plan.resolve() if raw_plan.is_absolute() else (project / raw_plan).resolve()
-    cases = Path(cases_root)
+    cases = Path(config.cases_root)
 
     # Auto-extract verification commands from plan when not explicitly provided
     commands = tuple(verification_commands or ())
@@ -964,7 +978,8 @@ def create_case(
         commands = tuple(_extract_verification(project, plan.parent))
 
     # Try to discover local evidence sources
-    evidence_records = _discover_case_evidence(project)
+    scan_warnings: list[str] = list(_scan_warnings) if _scan_warnings is not None else []
+    evidence_records = _discover_case_evidence(project, scan_warnings=scan_warnings)
     evidence_labels = tuple(_evidence_record_label(r) for r in evidence_records)
 
     auto_reason = ""
@@ -990,7 +1005,7 @@ def create_case(
         reference_target=_git_head(project),
     )
     _write_case_yaml(case)
-    _write_evidence_sources(case, evidence_records)
+    _write_evidence_sources(case, evidence_records, scan_warnings=scan_warnings)
     _write_case_task(case, evidence_records)
     _save_reference_evidence(case, project)
 
@@ -998,14 +1013,14 @@ def create_case(
     case, _dup_status = _apply_duplicate_check(
         case,
         cases,
-        allow_duplicate=allow_duplicate,
+        allow_duplicate=config.allow_duplicate,
     )
 
     return case
 
 
 def load_case(cases_root: str | Path, case_id: str) -> ReplayCase:
-    root = Path(cases_root) / case_id
+    root = resolve_case_dir(cases_root, case_id)
     data = parse_simple_yaml(root / "case.yaml")
     if not data.get("id"):
         raise ValueError(f"case.yaml at {root} is missing required field 'id'")
@@ -1194,7 +1209,16 @@ def _save_reference_evidence(case: ReplayCase, project_path: Path) -> None:
 
     ref_dir = case.root / "_reference"
     ref_dir.mkdir(parents=True, exist_ok=True)
-    (ref_dir / "diff.patch").write_text(diff_output, encoding="utf-8")
+    # Cap diff at 10 MB to avoid runaway disk usage on projects with large history gaps.
+    _MAX_DIFF_BYTES = 10 * 1024 * 1024
+    diff_bytes = diff_output.encode("utf-8", errors="replace")
+    if len(diff_bytes) > _MAX_DIFF_BYTES:
+        (ref_dir / "diff.patch").write_text(
+            diff_output[:_MAX_DIFF_BYTES] + "\n... [truncated — reference diff exceeds 10 MB]\n",
+            encoding="utf-8",
+        )
+    else:
+        (ref_dir / "diff.patch").write_text(diff_output, encoding="utf-8")
 
     _write_simple_yaml(
         ref_dir / "reference_metadata.yaml",
@@ -1521,11 +1545,23 @@ def _write_synthetic_task(
         "## Reconstructed Task",
     ])
 
-    # Objective
+    # Objective → also promoted to ## Goal for validate_case_task compatibility
     commit_subject = str(ctx.get("commit_subject", ""))
     commit_body = str(ctx.get("commit_body", ""))
     if commit_subject:
+        goal_text = commit_subject
+        if commit_body:
+            goal_text = f"{commit_subject}\n\nAdditional context: {commit_body}"
         lines.extend([
+            "",
+            "## Goal",
+            "",
+            goal_text,
+            "",
+            f"Starting from base commit `{case.base_commit}`, implement the changes described by this commit message.",
+            "The original implementation exists as a later commit — produce equivalent changes independently.",
+            "",
+            "## Reconstructed Task",
             "",
             "### Objective",
             "",
@@ -1536,13 +1572,14 @@ def _write_synthetic_task(
                 "",
                 f"Additional context: _{commit_body}_",
             ])
-        lines.extend([
-            "",
-            f"Starting from base commit `{case.base_commit}`, implement the changes described by this commit message.",
-            "The original implementation exists as a later commit — produce equivalent changes independently.",
-        ])
     else:
         lines.extend([
+            "",
+            "## Goal",
+            "",
+            "Review the project state at the base commit and identify meaningful improvements.",
+            "",
+            "## Reconstructed Task",
             "",
             "### Objective",
             "",
@@ -1643,10 +1680,10 @@ def _next_run_id(case_id: str, runs_root: Path) -> str:
 
 
 def prepare_run(case: ReplayCase, *, runs_root: str | Path, runner_label: str) -> ReplayRun:
-    missing = validate_case(case)
-    if missing:
+    diagnostics = validate_case(case)
+    if diagnostics:
         raise ValueError(
-            f"Case {case.id} is incomplete — missing: {', '.join(missing)}. "
+            f"Case {case.id} is incomplete — missing: {format_diagnostics(diagnostics, separator=', ')}. "
             "Required fields: base_source, base_confidence, source_type, source_path, selection_reason, evidence_sources.md"
         )
     runs = Path(runs_root)
@@ -1661,22 +1698,41 @@ def prepare_run(case: ReplayCase, *, runs_root: str | Path, runner_label: str) -
         except FileExistsError:
             continue
     _create_worktree(case, workspace)
-    run = ReplayRun(run_id, run_root, case, runner_label, workspace)
-    _write_simple_yaml(
-        run_root / "run.yaml",
-        {
-            "id": run.id,
-            "case_id": case.id,
-            "runner_label": runner_label,
-            "anonymous_runner_id": _stable_anonymous_runner_id(run.id),
-            "workspace": workspace,
-            "base_commit": case.base_commit,
-            "status": "prepared",
-        },
-    )
-    _write_completion_template(run)
-    _write_run_task(run)
+    try:
+        run = ReplayRun(run_id, run_root, case, runner_label, workspace)
+        _write_simple_yaml(
+            run_root / "run.yaml",
+            {
+                "id": run.id,
+                "case_id": case.id,
+                "runner_label": runner_label,
+                "anonymous_runner_id": _stable_anonymous_runner_id(run.id),
+                "workspace": workspace,
+                "base_commit": case.base_commit,
+                "status": "prepared",
+            },
+        )
+        _write_completion_template(run)
+        _write_run_task(run)
+    except Exception:
+        _cleanup_worktree(workspace, case.project_path)
+        shutil.rmtree(run_root, ignore_errors=True)
+        raise
     return run
+
+
+def _cleanup_worktree(workspace: Path, project_path: str) -> None:
+    """Remove a git worktree and prune the parent repo's worktree metadata."""
+    try:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(workspace)],
+            cwd=project_path,
+            capture_output=True,
+            timeout=30,
+        )
+    except Exception:
+        pass
+    shutil.rmtree(workspace, ignore_errors=True)
 
 
 def _write_completion_template(run: ReplayRun) -> None:
@@ -1738,6 +1794,8 @@ def _extract_commit_fallback(case: ReplayCase, workspace: Path) -> bool:
     """
     workspace.mkdir(parents=True, exist_ok=True)
     # Use subprocess pipe directly: git archive | tar -x
+    archive_proc: subprocess.Popen[str] | None = None
+    tar_proc: subprocess.Popen[str] | None = None
     try:
         archive_env = {**os.environ, "COPYFILE_DISABLE": "1"}
         archive_proc = subprocess.Popen(
@@ -1753,17 +1811,28 @@ def _extract_commit_fallback(case: ReplayCase, workspace: Path) -> bool:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        archive_proc.stdout.close()  # allow archive_proc to receive SIGPIPE
-        _, tar_stderr = tar_proc.communicate(timeout=600)
+        if archive_proc.stdout is not None:
+            archive_proc.stdout.close()  # allow archive_proc to receive SIGPIPE
+        tar_proc.communicate(timeout=600)
         archive_proc.wait(timeout=600)
     except Exception:
+        for proc in (tar_proc, archive_proc):
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                try:
+                    proc.communicate(timeout=5)
+                except Exception:
+                    pass
         return False
     if archive_proc.returncode != 0 or tar_proc.returncode != 0:
         return False
     # Init a fresh git repo so collect_run can produce a diff
-    _git_run(["init"], cwd=workspace)
-    _git_run(["add", "-A"], cwd=workspace)
-    _git_run(["commit", "-m", "initial snapshot at base_commit", "--allow-empty"], cwd=workspace)
+    try:
+        _git_run(["init"], cwd=workspace)
+        _git_run(["add", "-A"], cwd=workspace)
+        _git_run(["commit", "-m", "initial snapshot at base_commit", "--allow-empty"], cwd=workspace)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
     return True
 
 
@@ -1778,6 +1847,8 @@ def _copy_project_tree(project_path: Path, workspace: Path) -> None:
         workspace,
         ignore=shutil.ignore_patterns(".git", ".gitignore", "_reference", ".gradle", ".idea", ".claude", ".worktrees", "build"),
         dirs_exist_ok=True,
+        symlinks=True,
+        ignore_dangling_symlinks=True,
     )
     # Init a fresh repo and commit the baseline so agent changes show up as diffs.
     try:
@@ -1968,6 +2039,41 @@ def _detect_suspicious_paths(changed_files: tuple[str, ...]) -> list[str]:
     return hits
 
 
+def _is_sensitive_untracked_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    lower_path = normalized.lower()
+    if any(pattern.replace("\\", "/") in lower_path for pattern in FORBIDDEN_PATH_PATTERNS):
+        return True
+
+    parts = [part.lower() for part in normalized.split("/") if part]
+    if ".ssh" in parts:
+        return True
+    fname = parts[-1] if parts else lower_path
+    if fname in SAFE_ENV_EXAMPLE_FILENAMES:
+        return False
+    if fname in SENSITIVE_UNTRACKED_FILENAMES:
+        return True
+    if fname.startswith(".env."):
+        return True
+    if fname.endswith(SENSITIVE_UNTRACKED_SUFFIXES):
+        return True
+    return any(pattern in fname for pattern in SENSITIVE_UNTRACKED_SUBSTRINGS)
+
+
+def _partition_collectable_untracked(paths: list[str]) -> tuple[list[str], list[str]]:
+    collectable: list[str] = []
+    skipped: list[str] = []
+    for path in paths:
+        fname = path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if fname in IGNORED_UNTRACKED_FILENAMES:
+            continue
+        if _is_sensitive_untracked_path(path):
+            skipped.append(path)
+        else:
+            collectable.append(path)
+    return collectable, skipped
+
+
 def _count_untracked(workspace: Path) -> int:
     output = _git_capture(workspace, ["ls-files", "--others", "--exclude-standard"])
     return len([line for line in output.strip().splitlines() if line])
@@ -2041,8 +2147,9 @@ def collect_run(run: ReplayRun) -> Evidence:
         diff_ref = base
 
     # Collect diff: first the standard tracked diff, then check for untracked
-    # files that the agent may have created but not staged.  When untracked
-    # files are present, stage them so the full result evidence is captured.
+    # files that the agent may have created but not staged.  Safe untracked
+    # files are marked intent-to-add so the working-tree diff includes them
+    # without staging credential-shaped files into evidence.
     # The evidence requirements tell agents to `git add -A`, but this is not
     # enforced — many agents skip it.  We recover the evidence here.
     diff = _git_capture(run.workspace, ["diff", diff_ref, "--binary"]) if diff_ref else _git_capture(run.workspace, ["diff", "--binary"])
@@ -2050,10 +2157,12 @@ def collect_run(run: ReplayRun) -> Evidence:
 
     untracked_raw = _git_capture(run.workspace, ["ls-files", "--others", "--exclude-standard"])
     untracked_files = [f for f in untracked_raw.strip().splitlines() if f]
+    collectable_untracked, skipped_untracked = _partition_collectable_untracked(untracked_files)
     if untracked_files:
-        _git_capture(run.workspace, ["add", "-A"])
-        diff = _git_capture(run.workspace, ["diff", "--cached", diff_ref, "--binary"]) if diff_ref else _git_capture(run.workspace, ["diff", "--cached", "--binary"])
-        changed_output = _git_capture(run.workspace, ["diff", "--cached", "--name-only", diff_ref]) if diff_ref else _git_capture(run.workspace, ["diff", "--cached", "--name-only"])
+        if collectable_untracked:
+            _git_capture(run.workspace, ["add", "--intent-to-add", "--", *collectable_untracked])
+        diff = _git_capture(run.workspace, ["diff", diff_ref, "--binary"]) if diff_ref else _git_capture(run.workspace, ["diff", "--binary"])
+        changed_output = _git_capture(run.workspace, ["diff", "--name-only", diff_ref]) if diff_ref else _git_capture(run.workspace, ["diff", "--name-only"])
 
     changed_files = tuple(f for f in changed_output.strip().splitlines() if f)
     diff_path = evidence_dir / "diff.patch"
@@ -2080,6 +2189,8 @@ def collect_run(run: ReplayRun) -> Evidence:
         "changed_files": list(changed_files),
         "diff_path": diff_path,
         "missing_fields": missing,
+        "skipped_untracked_files": list(skipped_untracked),
+        "skipped_untracked_file_count": len(skipped_untracked),
     }
     _write_telemetry_block(evidence_data, telemetry)
     _write_simple_yaml(evidence_dir / "evidence.yaml", evidence_data)
@@ -2212,42 +2323,41 @@ def _update_run_yaml_status(run_root: Path, health: RunHealth) -> None:
     _write_simple_yaml(run_yaml, data)
 
 
-def validate_case(case: ReplayCase) -> list[str]:
-    """Return a list of missing/incomplete fields for a case.
+def validate_case(case: ReplayCase) -> list[Diagnostic]:
+    """Return missing/incomplete field diagnostics for a case.
 
     An empty list means the case is complete.
     """
-    missing: list[str] = []
+    diagnostics: list[Diagnostic] = []
     if not case.base_source:
-        missing.append("base_source")
+        diagnostics.append(Diagnostic("error", "missing_field.base_source", "base_source is empty"))
     if not case.base_confidence or case.base_confidence == "unknown":
-        missing.append("base_confidence")
+        diagnostics.append(Diagnostic("error", "missing_field.base_confidence", "base_confidence is unknown or empty"))
     # base_commit may be empty for no_git / empty_history cases — that is valid.
     # Only flag it when the case claims a git-based source but has no commit.
     if not case.base_commit and case.source_type not in ("no_git", "empty_history", "manual"):
-        missing.append("base_commit")
+        diagnostics.append(Diagnostic("error", "missing_field.base_commit", "base_commit is empty for git-based source"))
     if not case.source_type:
-        missing.append("source_type")
+        diagnostics.append(Diagnostic("error", "missing_field.source_type", "source_type is empty"))
     if not case.source_path and case.source_type not in ("git_history", "no_git", "empty_history"):
-        missing.append("source_path")
+        diagnostics.append(Diagnostic("error", "missing_field.source_path", "source_path is empty"))
     if not case.selection_reason:
-        missing.append("selection_reason")
+        diagnostics.append(Diagnostic("error", "missing_field.selection_reason", "selection_reason is empty"))
     if not case.plan_path and case.source_type in ("orchestration_kit", "handoff_plan"):
-        missing.append("plan_path")
+        diagnostics.append(Diagnostic("error", "missing_field.plan_path", "plan_path is required for orchestration_kit/handoff_plan"))
     evidence_md = case.root / "evidence_sources.md"
     if not evidence_md.exists():
-        missing.append("evidence_sources.md")
-    # Quality warnings are logged separately, not added to blocking missing list.
-    return missing
+        diagnostics.append(Diagnostic("error", "missing_file.evidence_sources", "evidence_sources.md not found"))
+    return diagnostics
 
 
 _MAX_EVIDENCE_SOURCES = 10
 _MAX_PLAN_LINES = 200
 
 
-def _warn_case_quality(case: ReplayCase) -> list[str]:
+def _warn_case_quality(case: ReplayCase) -> list[Diagnostic]:
     """Return quality warnings for a case (non-blocking)."""
-    warnings: list[str] = []
+    diagnostics: list[Diagnostic] = []
 
     # Warn if evidence_sources list is too long (likely over-scoped)
     evidence_md = case.root / "evidence_sources.md"
@@ -2255,10 +2365,10 @@ def _warn_case_quality(case: ReplayCase) -> list[str]:
         content = evidence_md.read_text(encoding="utf-8")
         source_count = sum(1 for line in content.splitlines() if line.strip().startswith("-"))
         if source_count > _MAX_EVIDENCE_SOURCES:
-            warnings.append(
-                f"evidence_sources 有 {source_count} 项（上限 {_MAX_EVIDENCE_SOURCES}），"
-                "任务范围可能过大"
-            )
+            diagnostics.append(Diagnostic(
+                "warning", "scope.evidence_sources_count",
+                f"evidence_sources 有 {source_count} 项（上限 {_MAX_EVIDENCE_SOURCES}），任务范围可能过大",
+            ))
 
     # Warn if orchestration kit plan is too large
     if case.plan_path and case.source_type == "orchestration_kit":
@@ -2266,46 +2376,60 @@ def _warn_case_quality(case: ReplayCase) -> list[str]:
         if plan.exists():
             line_count = len(plan.read_text(encoding="utf-8").splitlines())
             if line_count > _MAX_PLAN_LINES:
-                warnings.append(
-                    f"plan 文件 {plan.name} 有 {line_count} 行（建议 ≤{_MAX_PLAN_LINES}），"
-                    "任务可能过于复杂"
-                )
+                diagnostics.append(Diagnostic(
+                    "warning", "scope.plan_size",
+                    f"plan 文件 {plan.name} 有 {line_count} 行（建议 ≤{_MAX_PLAN_LINES}），任务可能过于复杂",
+                ))
 
-    return warnings
+    return diagnostics
 
 
-def validate_case_task(case: ReplayCase) -> list[str]:
+def validate_case_task(case: ReplayCase) -> list[Diagnostic]:
     """Check case task.md content quality for agent executability."""
     task_md = case.root / "task.md"
     if not task_md.exists():
-        return ["missing case task.md"]
+        return [Diagnostic("error", "missing_file.task_md", "missing case task.md")]
 
     content = task_md.read_text(encoding="utf-8")
-    issues: list[str] = []
+    diagnostics: list[Diagnostic] = []
 
     # Goal must exist and be substantive
     if "## Goal" not in content:
-        issues.append("case task.md 缺少 ## Goal 段落")
+        diagnostics.append(Diagnostic("error", "content.missing_goal", "case task.md 缺少 ## Goal 段落"))
     else:
         goal_text = content.split("## Goal")[1].split("##")[0].strip()
         if len(goal_text) < 20:
-            issues.append(f"case task.md Goal 过于简略（{len(goal_text)} 字符，建议 ≥20）")
+            diagnostics.append(Diagnostic(
+                "warning", "content.goal_too_short",
+                f"case task.md Goal 过于简略（{len(goal_text)} 字符，建议 ≥20）",
+            ))
 
     # git_history cases must have a Change Summary
     if case.source_type == "git_history" and "## Change Summary" not in content:
-        issues.append("git_history case 缺少 ## Change Summary")
+        diagnostics.append(Diagnostic("error", "content.missing_change_summary", "git_history case 缺少 ## Change Summary"))
 
-    return issues
+    return diagnostics
 
 
-def score_run(run: ReplayRun, *, rubric_path: str | Path) -> Path:
+def _resolve_rubric_path(run: ReplayRun, rubric_path: str | Path | None) -> Path | None:
+    if rubric_path is not None:
+        return Path(rubric_path)
+    case_rubric = run.case.root / "eval_rubric.yaml"
+    if case_rubric.exists():
+        return case_rubric
+    default_rubric = Path("rubrics/default.yaml")
+    return default_rubric if default_rubric.exists() else None
+
+
+def score_run(run: ReplayRun, *, rubric_path: str | Path | None = None) -> Path:
     evidence_yaml = run.root / "evidence" / "evidence.yaml"
     if not evidence_yaml.exists():
         raise FileNotFoundError(
             f"Evidence not found at {evidence_yaml}. "
             "Run collect-run before score-run."
         )
-    rubric = parse_rubric(Path(rubric_path))
+    resolved_rubric_path = _resolve_rubric_path(run, rubric_path)
+    rubric = parse_rubric(resolved_rubric_path) if resolved_rubric_path is not None else {}
     anonymous = _anonymous_runner_id(run)
     evidence = parse_simple_yaml(run.root / "evidence" / "evidence.yaml")
     missing = list(evidence.get("missing_fields") or [])
@@ -2338,6 +2462,18 @@ def score_run(run: ReplayRun, *, rubric_path: str | Path) -> Path:
         f"- Diff present: {diff_path.exists() and diff_path.stat().st_size > 0}",
         f"- Completion report: {completion_path.exists()}",
     ]
+
+    expected_output = rubric.get("expected_output", "")
+    criteria = rubric.get("criteria", [])
+    if expected_output or criteria:
+        lines.extend([
+            "",
+            "## Rubric Expectations",
+        ])
+        if expected_output:
+            lines.append(f"- Expected output: {expected_output}")
+        if isinstance(criteria, list) and criteria:
+            lines.extend(f"- {item}" for item in criteria)
 
     # Include telemetry section
     telemetry_block = evidence.get("telemetry", None)
@@ -2608,7 +2744,7 @@ def report_all_cases(
     total_cases_with_evidence = 0
     tiers: dict[str, int] = {}
 
-    case_dirs = sorted(d for d in cases_dir.iterdir() if d.is_dir() and (d / "case.yaml").exists())
+    case_dirs = iter_case_dirs(cases_dir)
 
     for case_dir in case_dirs:
         case_data = parse_simple_yaml(case_dir / "case.yaml")

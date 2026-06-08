@@ -12,8 +12,10 @@ from replay_checker.agent_workflow import (
     create_extraction_flow,
     run_grading_flow,
 )
+from replay_checker.case_paths import iter_case_dirs
 from replay_checker.evaluation import Recommendation, write_recommendation
 from replay_checker.replay import (
+    IntakeConfig,
     batch_intake,
     collect_run,
     compare_case,
@@ -22,10 +24,12 @@ from replay_checker.replay import (
     _extract_verification,
     inspect_run_dir,
     intake,
+    load_case,
     parse_simple_yaml,
     prepare_run,
     report_all_cases,
 )
+import tools.project as project_tool
 from tools.replay import _print_preview
 
 
@@ -50,6 +54,36 @@ def test_default_runner_label_uses_date_and_agent_intro() -> None:
     )
 
     assert label == "2026-06-01-codex_gpt_5_senior_engineer_prefers_tests"
+
+
+def test_load_case_resolves_nested_inventory_case(tmp_path: Path) -> None:
+    case_root = tmp_path / "cases" / "inventory" / "demo_project" / "demo-case"
+    case_root.mkdir(parents=True)
+    (case_root / "case.yaml").write_text(
+        "\n".join([
+            "id: demo-case",
+            f"project_path: {tmp_path / 'project'}",
+            "plan_path: plan.md",
+            "base_commit: abc123",
+            "verification_commands:",
+            "  - pytest",
+            "base_source: git",
+            "base_confidence: high",
+            "source_type: git_history",
+            "source_path: commit",
+            "selection_reason: regression coverage",
+            "evidence_sources:",
+            "  - source",
+        ])
+        + "\n",
+        encoding="utf-8",
+    )
+    (case_root / "evidence_sources.md").write_text("- source\n", encoding="utf-8")
+
+    case = load_case(tmp_path / "cases", "demo-case")
+
+    assert case.id == "demo-case"
+    assert case.root == case_root
 
 
 def test_create_extraction_flow_generates_kit_and_launch_options(tmp_path: Path) -> None:
@@ -373,7 +407,7 @@ def test_intake_from_git_history_writes_synthetic_case_task_and_reference(tmp_pa
     _git(project, "add", "README.md")
     _git(project, "commit", "-m", "add historical change")
 
-    case = intake(cases_root=tmp_path / "cases", project_path=project)
+    case = intake(config=IntakeConfig(project_path=project, cases_root=tmp_path / "cases"))
 
     assert case.synthetic_case is True
     assert case.source_type == "git_history"
@@ -396,7 +430,7 @@ def test_synthetic_execution_package_goal_uses_reconstructed_task(tmp_path: Path
     _git(project, "add", "README.md")
     _git(project, "commit", "-m", "add historical change")
 
-    case = intake(cases_root=tmp_path / "cases", project_path=project)
+    case = intake(config=IntakeConfig(project_path=project, cases_root=tmp_path / "cases"))
     run = prepare_run(case, runs_root=tmp_path / "runs", runner_label="agent")
     task_text = (run.root / "TASK.md").read_text(encoding="utf-8")
 
@@ -425,6 +459,33 @@ def test_extract_verification_reads_bash_code_blocks(tmp_path: Path) -> None:
     ]
 
 
+def test_project_check_skips_nested_case_examples(tmp_path: Path, monkeypatch) -> None:
+    examples = tmp_path / "cases" / "examples" / "hello-world"
+    examples.mkdir(parents=True)
+    (examples / "case.yaml").write_text("id: hello-world\n", encoding="utf-8")
+    (examples / "task.md").write_text("# Task\n", encoding="utf-8")
+    (examples / "evidence_sources.md").write_text("# Evidence\n", encoding="utf-8")
+    monkeypatch.setattr(project_tool, "ROOT", tmp_path)
+
+    result = project_tool.Result()
+    project_tool.check_cases_complete(result)
+
+    assert "case examples missing case.yaml" not in result.issues
+    assert result.issues == []
+
+
+def test_project_commit_allows_work_tmp_gitkeep_only() -> None:
+    allowed, rejected = project_tool.classify_changes(
+        [
+            project_tool.GitChange("A ", "work/tmp/.gitkeep"),
+            project_tool.GitChange("A ", "work/tmp/scratch.txt"),
+        ]
+    )
+
+    assert [change.path for change in allowed] == ["work/tmp/.gitkeep"]
+    assert [change.path for change in rejected] == ["work/tmp/scratch.txt"]
+
+
 def test_create_case_resolves_relative_plan_path_from_project(
     tmp_path: Path,
     monkeypatch,
@@ -447,8 +508,7 @@ def test_create_case_resolves_relative_plan_path_from_project(
     monkeypatch.chdir(tmp_path)
 
     case = create_case(
-        cases_root=tmp_path / "cases",
-        project_path=project,
+        config=IntakeConfig(project_path=project, cases_root=tmp_path / "cases"),
         plan_path=Path("docs/plans/demo/INDEX.md"),
         base_commit=base,
         case_id="demo-case",
@@ -478,8 +538,7 @@ def test_create_case_writes_goal_for_manual_plan(tmp_path: Path) -> None:
     ).stdout.strip()
 
     case = create_case(
-        cases_root=tmp_path / "cases",
-        project_path=project,
+        config=IntakeConfig(project_path=project, cases_root=tmp_path / "cases"),
         plan_path=plan,
         base_commit=base,
         case_id="demo-case",
@@ -509,8 +568,7 @@ def test_reference_evidence_uses_cumulative_base_to_target_diff(tmp_path: Path) 
     _git(project, "commit", "-m", "implement demo plan")
 
     case = create_case(
-        cases_root=tmp_path / "cases",
-        project_path=project,
+        config=IntakeConfig(project_path=project, cases_root=tmp_path / "cases"),
         plan_path=plan,
         base_commit=base,
         case_id="demo-case",
@@ -539,8 +597,7 @@ def test_reference_metadata_handles_multiline_commit_message(tmp_path: Path) -> 
     _git(project, "commit", "-m", "implement demo", "-m", "contains detail:\n- one\n- two")
 
     case = create_case(
-        cases_root=tmp_path / "cases",
-        project_path=project,
+        config=IntakeConfig(project_path=project, cases_root=tmp_path / "cases"),
         plan_path=plan,
         base_commit=base,
         case_id="demo-case",
@@ -601,11 +658,9 @@ def test_batch_intake_uses_plan_state_base_commits(tmp_path: Path) -> None:
     _git(project, "commit", "-m", "add replay kits")
 
     cases = batch_intake(
-        cases_root=tmp_path / "cases",
-        project_path=project,
+        config=IntakeConfig(project_path=project, cases_root=tmp_path / "cases", allow_duplicate=True),
         min_score=1,
         max_cases=10,
-        allow_duplicate=True,
     )
 
     bases_by_plan = {Path(case.plan_path).parent.name: case.base_commit for case in cases}
@@ -660,14 +715,13 @@ def test_batch_intake_filters_low_quality_cases_before_returning(tmp_path: Path)
     _git(project, "commit", "-m", "add replay kits")
 
     cases = batch_intake(
-        cases_root=tmp_path / "cases",
-        project_path=project,
+        config=IntakeConfig(project_path=project, cases_root=tmp_path / "cases"),
         min_score=1,
         max_cases=10,
     )
 
     assert [Path(case.plan_path).parent.name for case in cases] == ["good-kit"]
-    assert sorted(path.name for path in (tmp_path / "cases").iterdir()) == [cases[0].id]
+    assert sorted(path.name for path in iter_case_dirs(tmp_path / "cases")) == [cases[0].id]
 
 
 def test_grading_flow_collects_scores_and_writes_compare_report(tmp_path: Path) -> None:
@@ -685,8 +739,7 @@ def test_grading_flow_collects_scores_and_writes_compare_report(tmp_path: Path) 
     plan.write_text("# Demo Plan\n", encoding="utf-8")
 
     case = create_case(
-        cases_root=tmp_path / "cases",
-        project_path=project,
+        config=IntakeConfig(project_path=project, cases_root=tmp_path / "cases"),
         plan_path=plan,
         base_commit=base,
         case_id="demo-case",
@@ -732,8 +785,7 @@ def test_prepare_run_allocates_next_run_id_after_numbering_gap(tmp_path: Path) -
     plan.write_text("# Demo Plan\n", encoding="utf-8")
 
     case = create_case(
-        cases_root=tmp_path / "cases",
-        project_path=project,
+        config=IntakeConfig(project_path=project, cases_root=tmp_path / "cases"),
         plan_path=plan,
         base_commit=base,
         case_id="demo-case",
@@ -767,8 +819,7 @@ def test_collect_run_updates_run_yaml_with_canonical_completed_status(tmp_path: 
     plan.write_text("# Demo Plan\n", encoding="utf-8")
 
     case = create_case(
-        cases_root=tmp_path / "cases",
-        project_path=project,
+        config=IntakeConfig(project_path=project, cases_root=tmp_path / "cases"),
         plan_path=plan,
         base_commit=base,
         case_id="demo-case",
@@ -801,8 +852,7 @@ def test_collect_run_accepts_workspace_completion_report(tmp_path: Path) -> None
     plan.write_text("# Demo Plan\n", encoding="utf-8")
 
     case = create_case(
-        cases_root=tmp_path / "cases",
-        project_path=project,
+        config=IntakeConfig(project_path=project, cases_root=tmp_path / "cases"),
         plan_path=plan,
         base_commit=base,
         case_id="demo-case",
@@ -819,6 +869,43 @@ def test_collect_run_accepts_workspace_completion_report(tmp_path: Path) -> None
     assert run_data["completion_report_exists"] == "yes"
 
 
+def test_collect_run_skips_sensitive_untracked_files(tmp_path: Path) -> None:
+    project = tmp_path / "target"
+    _init_project(project)
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=project,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    plan = project / "docs" / "plans" / "demo" / "INDEX.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("# Demo Plan\n", encoding="utf-8")
+
+    case = create_case(
+        config=IntakeConfig(project_path=project, cases_root=tmp_path / "cases"),
+        plan_path=plan,
+        base_commit=base,
+        case_id="demo-case",
+    )
+    run = prepare_run(case, runs_root=tmp_path / "runs", runner_label="agent")
+    (run.workspace / "feature.txt").write_text("safe result\n", encoding="utf-8")
+    (run.workspace / ".env").write_text("API_TOKEN=do-not-copy\n", encoding="utf-8")
+    (run.workspace / "completion_report.md").write_text("status: completed\n", encoding="utf-8")
+
+    collect_run(run)
+
+    diff_text = (run.root / "evidence" / "diff.patch").read_text(encoding="utf-8")
+    evidence = parse_simple_yaml(run.root / "evidence" / "evidence.yaml")
+    assert "feature.txt" in diff_text
+    assert "safe result" in diff_text
+    assert "API_TOKEN=do-not-copy" not in diff_text
+    assert evidence["changed_files"] == ["feature.txt"]
+    assert evidence["skipped_untracked_files"] == [".env"]
+    assert evidence["skipped_untracked_file_count"] == "1"
+
+
 def test_run_doctor_marks_partial_report_as_partial(tmp_path: Path) -> None:
     project = tmp_path / "target"
     _init_project(project)
@@ -833,8 +920,7 @@ def test_run_doctor_marks_partial_report_as_partial(tmp_path: Path) -> None:
     plan.parent.mkdir(parents=True)
     plan.write_text("# Demo Plan\n", encoding="utf-8")
     case = create_case(
-        cases_root=tmp_path / "cases",
-        project_path=project,
+        config=IntakeConfig(project_path=project, cases_root=tmp_path / "cases"),
         plan_path=plan,
         base_commit=base,
         case_id="demo-case",
@@ -912,8 +998,7 @@ def test_compare_default_uses_concise_recommendation_when_available(tmp_path: Pa
     plan.write_text("# Demo Plan\n", encoding="utf-8")
 
     case = create_case(
-        cases_root=tmp_path / "cases",
-        project_path=project,
+        config=IntakeConfig(project_path=project, cases_root=tmp_path / "cases"),
         plan_path=plan,
         base_commit=base,
         case_id="demo-case",
@@ -965,8 +1050,7 @@ def test_compare_default_does_not_show_stale_positive_score_when_gates_fail(tmp_
     plan.write_text("# Demo Plan\n", encoding="utf-8")
 
     case = create_case(
-        cases_root=tmp_path / "cases",
-        project_path=project,
+        config=IntakeConfig(project_path=project, cases_root=tmp_path / "cases"),
         plan_path=plan,
         base_commit=base,
         case_id="demo-case",
@@ -1013,8 +1097,7 @@ def test_aggregate_report_does_not_rank_stale_positive_score_when_gates_fail(tmp
     plan.write_text("# Demo Plan\n", encoding="utf-8")
 
     case = create_case(
-        cases_root=tmp_path / "cases",
-        project_path=project,
+        config=IntakeConfig(project_path=project, cases_root=tmp_path / "cases"),
         plan_path=plan,
         base_commit=base,
         case_id="demo-case",

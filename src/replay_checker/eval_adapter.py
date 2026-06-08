@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .case_paths import case_inventory_root
 from .core import sanitize_slug, stable_hash
 from .git_utils import git_output
 from .replay import _write_simple_yaml
@@ -54,7 +55,7 @@ def write_skill_eval_case(eval_case: SkillEvalCase, cases_root: str | Path, skil
     """Write case.yaml, task.md, evidence_sources.md, and eval_rubric.yaml."""
     repo = Path(skill_repo).resolve()
     case_id = _case_id(eval_case)
-    case_root = Path(cases_root) / case_id
+    case_root = case_inventory_root(cases_root, repo) / case_id
     case_root.mkdir(parents=True, exist_ok=True)
     base_commit, base_source, base_confidence = _repo_base(repo)
     evidence_sources = [f"skill_eval: {eval_case.skill_name} eval {eval_case.eval_id}"]
@@ -92,12 +93,15 @@ def generate_skill_rubric(eval_case: SkillEvalCase) -> dict[str, Any]:
     return {
         "result_weight": "80",
         "process_weight": "20",
+        "expected_output": eval_case.expected_output,
         "criteria": [f"assertion: {assertion}" for assertion in eval_case.assertions],
     }
 
 
 def eval_to_case_data(eval_case: SkillEvalCase, cases_root: str | Path) -> dict[str, Any]:
     case_id = _case_id(eval_case)
+    evals_path = Path(eval_case.evals_path)
+    repo = evals_path.parents[3] if len(evals_path.parents) > 3 else evals_path.parent
     return {
         "id": case_id,
         "source_type": "skill_eval",
@@ -108,7 +112,7 @@ def eval_to_case_data(eval_case: SkillEvalCase, cases_root: str | Path) -> dict[
         "assertions": eval_case.assertions,
         "files": eval_case.files,
         "workspace_files": eval_case.workspace_files,
-        "root": Path(cases_root) / case_id,
+        "root": case_inventory_root(cases_root, repo) / case_id,
     }
 
 
@@ -217,10 +221,22 @@ def dedupe_eval_cases(cases_root: str | Path, *, dry_run: bool = False) -> list[
             kept_name = keep.name
             removed_name = obsolete.name
             if not dry_run:
+                if not _is_safe_case_dir(root, obsolete):
+                    continue
                 shutil.rmtree(obsolete)
             removed.append((kept_name, removed_name))
 
     return removed
+
+
+def _is_safe_case_dir(root: Path, candidate: Path) -> bool:
+    if candidate.is_symlink():
+        return False
+    try:
+        candidate.resolve(strict=False).relative_to(root.resolve(strict=False))
+    except ValueError:
+        return False
+    return candidate.is_dir()
 
 
 def _eval_case_prefix(name: str) -> str | None:

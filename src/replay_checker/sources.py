@@ -67,6 +67,8 @@ def default_claude_history_roots() -> tuple[Path, ...]:
 def discover_evidence_sources(
     project_path: str | Path,
     config: EvidenceSourceConfig | None = None,
+    *,
+    warnings: list[str] | None = None,
 ) -> list[EvidenceRecord]:
     project = Path(project_path).resolve()
     cfg = config or (
@@ -77,10 +79,13 @@ def discover_evidence_sources(
             claude_history_roots=default_claude_history_roots(),
         )
     )
+    scan_warnings: list[str] | None = [] if warnings is not None else None
     records: list[EvidenceRecord] = []
     records.extend(scan_plan_records(project))
-    records.extend(scan_codex_history(project, cfg.codex_history_roots))
-    records.extend(scan_claude_history(project, cfg.claude_history_roots))
+    records.extend(scan_codex_history(project, cfg.codex_history_roots, warnings=scan_warnings))
+    records.extend(scan_claude_history(project, cfg.claude_history_roots, warnings=scan_warnings))
+    if warnings is not None and scan_warnings:
+        warnings.extend(scan_warnings)
     return records
 
 
@@ -113,12 +118,12 @@ def scan_plan_records(project_path: str | Path) -> list[EvidenceRecord]:
     return records
 
 
-def scan_codex_history(project_path: str | Path, roots: Iterable[str | Path]) -> list[EvidenceRecord]:
-    return _scan_history(project_path, roots, source_type="codex_history")
+def scan_codex_history(project_path: str | Path, roots: Iterable[str | Path], *, warnings: list[str] | None = None) -> list[EvidenceRecord]:
+    return _scan_history(project_path, roots, source_type="codex_history", warnings=warnings)
 
 
-def scan_claude_history(project_path: str | Path, roots: Iterable[str | Path]) -> list[EvidenceRecord]:
-    return _scan_history(project_path, roots, source_type="claude_history")
+def scan_claude_history(project_path: str | Path, roots: Iterable[str | Path], *, warnings: list[str] | None = None) -> list[EvidenceRecord]:
+    return _scan_history(project_path, roots, source_type="claude_history", warnings=warnings)
 
 
 def _project_aliases(project: Path) -> list[tuple[str, str]]:
@@ -225,6 +230,7 @@ def _scan_history(
     roots: Iterable[str | Path],
     *,
     source_type: str,
+    warnings: list[str] | None = None,
 ) -> list[EvidenceRecord]:
     project = Path(project_path).resolve()
     project_text = str(project)
@@ -233,7 +239,9 @@ def _scan_history(
     for file_path in _iter_history_files(roots):
         try:
             text = file_path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
+        except OSError as exc:
+            if warnings is not None:
+                warnings.append(f"skipped {file_path}: {exc}")
             continue
 
         # Check all aliases; prefer the most specific match
@@ -283,18 +291,36 @@ def _scan_history(
     return records
 
 
-def _iter_history_files(roots: Iterable[str | Path]) -> Iterable[Path]:
+def _iter_history_files(
+    roots: Iterable[str | Path],
+    *,
+    max_files: int = 500,
+) -> Iterable[Path]:
     suffixes = {".jsonl", ".json", ".md", ".txt", ".log"}
+    yielded = 0
     for root_like in roots:
+        if yielded >= max_files:
+            return
         root = Path(root_like).expanduser()
         if root.is_file() and root.suffix.lower() in suffixes and not _is_metadata_path(root):
             yield root
+            yielded += 1
             continue
         if not root.is_dir():
             continue
-        for path in sorted(root.rglob("*")):
-            if path.is_file() and path.suffix.lower() in suffixes and not _is_metadata_path(path):
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(
+                d for d in dirnames
+                if not _is_metadata_path(Path(dirpath) / d)
+            )
+            for filename in sorted(filenames):
+                if yielded >= max_files:
+                    return
+                path = Path(dirpath) / filename
+                if path.suffix.lower() not in suffixes or _is_metadata_path(path):
+                    continue
                 yield path
+                yielded += 1
 
 
 def _history_summary(text: str) -> str:
@@ -386,7 +412,23 @@ def score_evidence_records(
     project_path: str | Path | None = None,
 ) -> list[EvidenceRecord]:
     """Return *new* EvidenceRecord instances with relevance_score populated."""
-    return [score_single_record(r, index, len(records), project_path=project_path) for index, r in enumerate(records)]
+    project_files: set[str] | None = None
+    if project_path is not None and any(
+        r.source_type in ("codex_history", "claude_history")
+        and bool(r.metadata.get("mentioned_files", ""))
+        for r in records
+    ):
+        project_files = _collect_project_files(Path(project_path))
+    return [
+        score_single_record(
+            r,
+            index,
+            len(records),
+            project_path=project_path,
+            project_files=project_files,
+        )
+        for index, r in enumerate(records)
+    ]
 
 
 def score_single_record(
@@ -395,6 +437,7 @@ def score_single_record(
     total: int,
     *,
     project_path: str | Path | None = None,
+    project_files: set[str] | None = None,
 ) -> EvidenceRecord:
     score = 0.0
     reasons: list[str] = []
@@ -403,7 +446,11 @@ def score_single_record(
     if record.source_type == "plan":
         score, reasons, task_signal = _score_plan_record(record)
     elif record.source_type in ("codex_history", "claude_history"):
-        score, reasons, task_signal = _score_history_record(record, project_path=project_path)
+        score, reasons, task_signal = _score_history_record(
+            record,
+            project_path=project_path,
+            project_files=project_files,
+        )
     else:
         reasons.append(f"source_type={record.source_type}")
 
@@ -466,6 +513,7 @@ def _score_history_record(
     record: EvidenceRecord,
     *,
     project_path: str | Path | None = None,
+    project_files: set[str] | None = None,
 ) -> tuple[float, list[str], str]:
     summary = record.summary.lower()
     reasons: list[str] = []
@@ -495,8 +543,10 @@ def _score_history_record(
     # File co-occurrence boost: mentioned files that look like real project files
     mentioned_files = record.metadata.get("mentioned_files", "")
     if mentioned_files and project_path:
-        project_files = _collect_project_files(Path(project_path))
-        overlap = _file_overlap_score(mentioned_files.split(","), project_files)
+        file_inventory = project_files
+        if file_inventory is None:
+            file_inventory = _collect_project_files(Path(project_path))
+        overlap = _file_overlap_score(mentioned_files.split(","), file_inventory)
         if overlap > 0:
             file_bonus = 0.1 * min(overlap, 3)
             score += file_bonus

@@ -18,6 +18,38 @@ class ApiDisabledError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class Diagnostic:
+    """Unified validation result across all Replay Checker validators.
+
+    Every validator that answers "is this artifact structurally complete
+    and internally consistent?" returns ``list[Diagnostic]``.
+    """
+    severity: str  # "error" | "warning" | "info"
+    code: str      # machine-readable code, e.g. "missing_field.base_source"
+    message: str   # human-readable description
+
+    def __str__(self) -> str:
+        return self.message
+
+
+def format_diagnostics(diagnostics: list[Diagnostic], *, separator: str = "; ") -> str:
+    """Join diagnostic messages for display."""
+    return separator.join(d.message for d in diagnostics)
+
+
+def has_error(diagnostics: list[Diagnostic]) -> bool:
+    return any(d.severity == "error" for d in diagnostics)
+
+
+def has_warning(diagnostics: list[Diagnostic]) -> bool:
+    return any(d.severity == "warning" for d in diagnostics)
+
+
+def diagnostics_by_severity(diagnostics: list[Diagnostic], severity: str) -> list[Diagnostic]:
+    return [d for d in diagnostics if d.severity == severity]
+
+
 def project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 

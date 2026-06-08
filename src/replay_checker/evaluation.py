@@ -1025,7 +1025,7 @@ def recompute(
 
     # Snapshot existing current/ if it has real content
     if (cur / "summary.yaml").exists():
-        ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+        ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H%M%S.%fZ")
         snapshot_current(case, ts)
 
     # Use provided dimensions or defaults
@@ -1087,7 +1087,7 @@ def _recompute_dimension_ranking(
     scored = [
         (r, r.dimension_scores.get(dimension, 0.0))
         for r in runs
-        if r.status != "missing-completion-report"
+        if _is_scorable_run(r)
     ]
     if not scored:
         return
@@ -1135,7 +1135,7 @@ def _recompute_dimension_comparisons(
     Only compares runs that both have evidence (status is not missing-completion-report).
     Runs with missing evidence are marked incomparable with insufficient_evidence.
     """
-    valid_runs = [r for r in runs if r.status != "missing-completion-report"]
+    valid_runs = [r for r in runs if _is_scorable_run(r)]
     incomplete_runs = [r for r in runs if r.status == "missing-completion-report"]
 
     # Compute valid-run comparisons in queue order when available
@@ -1267,24 +1267,20 @@ def _build_summary(
             best_run_id="",
         )
 
-    valid_runs = [r for r in runs if r.status != "missing-completion-report"]
+    valid_runs = [r for r in runs if _is_scorable_run(r)]
 
     # Compute weighted total scores with capped structural contribution
     dim_weights = {d.name: d.weight for d in dims}
     total_weight = sum(dim_weights.values()) or 1.0
 
     best_run_id = ""
-    best_score = -1.0
+    best_score: float | None = None
     best_tier = EligibilityTier.INVALID
 
     for run in runs:
         # Invalid runs get no score at all
         if run.tier == EligibilityTier.INVALID:
             run.total_score = 0.0
-            if run.total_score > best_score:
-                best_score = run.total_score
-                best_run_id = run.run_id
-                best_tier = run.tier
             continue
 
         # Base score from weighted dimension scores
@@ -1302,7 +1298,7 @@ def _build_summary(
         # Promote tier based on capped total score
         run.tier = promote_tier_from_scores(run.tier, run.total_score, capped_sc)
 
-        if run.total_score > best_score:
+        if best_score is None or run.total_score > best_score:
             best_score = run.total_score
             best_run_id = run.run_id
             best_tier = run.tier
@@ -1338,10 +1334,15 @@ def _build_summary(
         tier=overall_tier,
         validity=validity,
         confidence=confidence,
-        total_score=best_score,
+        total_score=best_score if best_score is not None else 0.0,
         run_count=len(runs),
         best_run_id=best_run_id,
     )
+
+
+def _is_scorable_run(run: RunAttempt) -> bool:
+    """Return True when a run has evidence and is not invalidated."""
+    return run.status != "missing-completion-report" and run.tier != EligibilityTier.INVALID
 
 
 def _collect_all_comparisons(case_root: Path) -> list[PairwiseComparison]:
@@ -1411,9 +1412,16 @@ def _build_recommendation(
             confidence=summary.confidence,
         )
 
-    valid_runs = [r for r in runs if r.status != "missing-completion-report"]
+    valid_runs = [r for r in runs if _is_scorable_run(r)]
 
     if not valid_runs:
+        if any(r.tier == EligibilityTier.INVALID for r in runs):
+            return Recommendation(
+                score=0.0,
+                sentence="Score is invalid — evidence gates not met.",
+                validity=summary.validity,
+                confidence=summary.confidence,
+            )
         return Recommendation(
             score=0.0,
             sentence="All runs have insufficient evidence for evaluation.",

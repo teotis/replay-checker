@@ -275,6 +275,8 @@ def check_cases_complete(result: Result) -> None:
 
     sys.path.insert(0, str(ROOT / "src"))
     try:
+        from replay_checker.case_paths import iter_case_dirs
+        from replay_checker.core import Diagnostic, format_diagnostics
         from replay_checker.replay import load_case, validate_case
     except Exception as exc:
         result.issues.append(f"cannot import case validator: {exc}")
@@ -286,18 +288,18 @@ def check_cases_complete(result: Result) -> None:
             pass
 
     checked = 0
-    for case_dir in sorted(path for path in cases_root.iterdir() if path.is_dir()):
-        if not (case_dir / "case.yaml").exists():
-            result.issues.append(f"case {case_dir.name} missing case.yaml")
+    for case_dir in iter_case_dirs(cases_root):
+        rel_parts = case_dir.relative_to(cases_root).parts
+        if rel_parts and rel_parts[0] == "examples":
             continue
         checked += 1
         try:
             case = load_case(cases_root, case_dir.name)
             issues = validate_case(case)
         except Exception as exc:
-            issues = [str(exc)]
+            issues = [Diagnostic("error", "load_failed", str(exc))]
         if issues:
-            result.issues.append(f"case {case_dir.name} incomplete: {'; '.join(issues)}")
+            result.issues.append(f"case {case_dir.name} incomplete: {format_diagnostics(issues)}")
 
     if checked:
         result.notices.append(f"replay cases complete: {checked}")
@@ -596,6 +598,8 @@ def git_changes() -> list[GitChange]:
 
 
 def is_rejected(path: str) -> bool:
+    if path in {"work/tmp/.gitkeep", "work/out/.gitkeep", "runs/.gitkeep"}:
+        return False
     if any(path == prefix.rstrip("/") or path.startswith(prefix) for prefix in REJECT_PREFIXES):
         return True
     if path.startswith("work/out/") and path != "work/out/.gitkeep":

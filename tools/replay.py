@@ -10,6 +10,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from replay_checker.linters import lint_task, lint_score  # noqa: E402
 from replay_checker.replay import (  # noqa: E402
+    IntakeConfig,
     batch_intake,
     collect_run,
     compare_case,
@@ -113,13 +114,15 @@ def cmd_inspect_candidates(args: argparse.Namespace) -> int:
 
 def cmd_create_case(args: argparse.Namespace) -> int:
     case = create_case(
-        cases_root=args.cases_root,
-        project_path=args.project,
+        config=IntakeConfig(
+            project_path=Path(args.project),
+            cases_root=Path(args.cases_root),
+            allow_duplicate=getattr(args, 'allow_duplicate', False),
+        ),
         plan_path=args.plan,
         base_commit=args.base,
         case_id=args.case_id,
         verification_commands=args.verify,
-        allow_duplicate=getattr(args, 'allow_duplicate', False),
     )
     print(f"Created case: {case.root / 'case.yaml'}")
     return 0
@@ -173,11 +176,13 @@ def cmd_score_run(args: argparse.Namespace) -> int:
 
 def cmd_intake(args: argparse.Namespace) -> int:
     case = intake(
-        cases_root=args.cases_root,
-        project_path=args.project,
-        codex_history_roots=tuple(args.codex_history_root) if args.codex_history_root else None,
-        claude_history_roots=tuple(args.claude_history_root) if args.claude_history_root else None,
-        allow_duplicate=getattr(args, 'allow_duplicate', False),
+        config=IntakeConfig(
+            project_path=Path(args.project),
+            cases_root=Path(args.cases_root),
+            codex_history_roots=tuple(Path(p) for p in args.codex_history_root) if args.codex_history_root else (),
+            claude_history_roots=tuple(Path(p) for p in args.claude_history_root) if args.claude_history_root else (),
+            allow_duplicate=getattr(args, 'allow_duplicate', False),
+        ),
     )
     print(f"Created case: {case.root / 'case.yaml'}")
     print(f"Source: {case.source_type} ({case.selection_reason})")
@@ -201,19 +206,21 @@ def cmd_batch_intake(args: argparse.Namespace) -> int:
     min_score = getattr(args, "min_score", 3)
     max_cases = getattr(args, "max_cases", 50)
     cases = batch_intake(
-        cases_root=args.cases_root,
-        project_path=args.project,
+        config=IntakeConfig(
+            project_path=Path(args.project),
+            cases_root=Path(args.cases_root),
+            codex_history_roots=tuple(Path(p) for p in args.codex_history_root) if args.codex_history_root else (),
+            claude_history_roots=tuple(Path(p) for p in args.claude_history_root) if args.claude_history_root else (),
+            allow_duplicate=getattr(args, "allow_duplicate", False),
+        ),
         min_score=min_score,
         max_cases=max_cases,
-        codex_history_roots=tuple(args.codex_history_root) if args.codex_history_root else None,
-        claude_history_roots=tuple(args.claude_history_root) if args.claude_history_root else None,
-        allow_duplicate=getattr(args, "allow_duplicate", False),
     )
     print(f"Batch intake complete: {len(cases)} cases created")
     print()
     for case in cases:
-        score_label = f" (score: case.score)" if case.candidate_score > 0 else ""
-        print(f"  {case.id} | {case.source_type} | base: {case.base_commit[:12] if case.base_commit else '(none)'}")
+        score_suffix = f" (score: {case.candidate_score})" if case.candidate_score > 0 else ""
+        print(f"  {case.id} | {case.source_type} | base: {case.base_commit[:12] if case.base_commit else '(none)'}{score_suffix}")
     print()
     print("Next steps:")
     print(f"  Review cases: ls {args.cases_root}/")
@@ -350,10 +357,12 @@ def cmd_wizard(args: argparse.Namespace) -> int:
 
             print("--- Compiling case via intake ---\n")
             case = intake(
-                cases_root=args.cases_root,
-                project_path=args.project,
-                codex_history_roots=tuple(args.codex_history_root) if args.codex_history_root else None,
-                claude_history_roots=tuple(args.claude_history_root) if args.claude_history_root else None,
+                config=IntakeConfig(
+                    project_path=Path(args.project),
+                    cases_root=Path(args.cases_root),
+                    codex_history_roots=tuple(Path(p) for p in args.codex_history_root) if args.codex_history_root else (),
+                    claude_history_roots=tuple(Path(p) for p in args.claude_history_root) if args.claude_history_root else (),
+                ),
             )
             print(f"Created case: {case.root / 'case.yaml'}")
             print(f"Source: {case.source_type} ({case.selection_reason})")
@@ -596,7 +605,7 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("--cases-root", default="cases")
     score.add_argument("--runs-root", default="runs")
     score.add_argument("--run", required=True)
-    score.add_argument("--rubric", default="rubrics/default.yaml")
+    score.add_argument("--rubric", default=None)
     score.set_defaults(func=cmd_score_run)
 
     compare = sub.add_parser("compare", help="compare collected runs for one case")

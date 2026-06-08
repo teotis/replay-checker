@@ -305,6 +305,16 @@ def _emit_key_value(
         lines.append(f"{marker}{key}: {value}")
 
 
+def parse_simple_yaml(path: str | Path) -> dict[str, object]:
+    """Parse the tiny YAML subset this project writes: scalar keys, string lists, nested blocks."""
+    data = parse_yaml_file(
+        path,
+        scalar_parser=coerce_nested_int,
+        parse_list_item_dicts=False,
+    )
+    return data if isinstance(data, dict) else {}
+
+
 def _emit_dict_as_list_item(
     lines: list[str],
     item: dict[str, Any],

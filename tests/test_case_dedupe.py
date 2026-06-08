@@ -394,6 +394,11 @@ class TestScanAndInspect:
         result = scan_all_fingerprints(tmp_path)
         assert len(result) == 2
 
+    def test_scan_returns_nested_inventory_cases(self, tmp_path):
+        _make_case(tmp_path / "inventory" / "demo_project", "case-1")
+        result = scan_all_fingerprints(tmp_path)
+        assert set(result) == {"case-1"}
+
     def test_inspect_duplicates_returns_structure(self, tmp_path):
         _make_case(tmp_path, "case-1")
         _make_case(tmp_path, "case-2")

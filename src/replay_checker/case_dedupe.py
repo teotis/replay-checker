@@ -15,18 +15,9 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
+from .case_paths import iter_case_dirs
 from .core import stable_hash
-from .yaml_lite import parse_yaml_file, coerce_nested_int
-
-
-def _parse_simple_yaml(path: Path) -> dict[str, object]:
-    """Parse the tiny YAML subset this project writes."""
-    data = parse_yaml_file(
-        path,
-        scalar_parser=coerce_nested_int,
-        parse_list_item_dicts=False,
-    )
-    return data if isinstance(data, dict) else {}
+from .yaml_lite import parse_simple_yaml
 
 
 # Chunk size for streaming large diff.patch files (64 KiB).
@@ -148,7 +139,7 @@ def _extract_changed_files_from_diff(diff_path: Path) -> set[str]:
 
 def _read_case_metadata(case_dir: Path) -> dict[str, Any]:
     """Read case.yaml and return a plain dict."""
-    data = _parse_simple_yaml(case_dir / "case.yaml")
+    data = parse_simple_yaml(case_dir / "case.yaml")
     return data if isinstance(data, dict) else {}
 
 
@@ -157,7 +148,7 @@ def _read_reference_metadata(case_dir: Path) -> dict[str, Any]:
     meta_path = case_dir / "_reference" / "reference_metadata.yaml"
     if not meta_path.exists():
         return {}
-    data = _parse_simple_yaml(meta_path)
+    data = parse_simple_yaml(meta_path)
     return data if isinstance(data, dict) else {}
 
 
@@ -402,13 +393,7 @@ def _skill_eval_prefix(case_id: str) -> str:
 def scan_all_fingerprints(cases_root: Path) -> dict[str, CaseFingerprint]:
     """Build fingerprints for every case directory under *cases_root*."""
     result: dict[str, CaseFingerprint] = {}
-    if not cases_root.is_dir():
-        return result
-    for child in sorted(cases_root.iterdir()):
-        if not child.is_dir() or child.name.startswith("."):
-            continue
-        if not (child / "case.yaml").exists():
-            continue
+    for child in iter_case_dirs(cases_root):
         fp = build_case_fingerprint(child)
         result[fp.case_id] = fp
     return result
@@ -417,13 +402,7 @@ def scan_all_fingerprints(cases_root: Path) -> dict[str, CaseFingerprint]:
 def _build_case_dir_map(cases_root: Path) -> dict[str, Path]:
     """Map case_id to its directory for text-based comparison."""
     result: dict[str, Path] = {}
-    if not cases_root.is_dir():
-        return result
-    for child in sorted(cases_root.iterdir()):
-        if not child.is_dir() or child.name.startswith("."):
-            continue
-        if not (child / "case.yaml").exists():
-            continue
+    for child in iter_case_dirs(cases_root):
         meta = _read_case_metadata(child)
         case_id = str(meta.get("id", child.name))
         result[case_id] = child

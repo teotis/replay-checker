@@ -10,6 +10,7 @@ Covers:
 
 from __future__ import annotations
 
+import pytest
 from pathlib import Path
 
 from replay_checker.evaluation import (
@@ -25,7 +26,8 @@ from replay_checker.evaluation import (
     read_summary,
     write_recommendation,
 )
-from replay_checker.replay import ReplayCase, _build_compare_output
+from replay_checker.eval_adapter import SkillEvalCase, dedupe_eval_cases, generate_skill_rubric
+from replay_checker.replay import ReplayCase, ReplayRun, _build_compare_output, score_run
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +65,83 @@ def _write_fake_evidence(run_dir: Path, status: str = "completed") -> None:
         f"run_id: {run_dir.name}\nstatus: {status}\nchanged_files:\n  - x\n",
         encoding="utf-8",
     )
+
+
+def test_skill_eval_rubric_includes_expected_output() -> None:
+    eval_case = SkillEvalCase(
+        skill_name="demo-skill",
+        eval_id=1,
+        prompt="Do the thing",
+        expected_output="Explains the expected behavior.",
+        assertions=["mentions verification"],
+        files=[],
+        evals_path=Path("skills/demo-skill/evals/evals.json"),
+    )
+
+    rubric = generate_skill_rubric(eval_case)
+
+    assert rubric["expected_output"] == "Explains the expected behavior."
+    assert rubric["criteria"] == ["assertion: mentions verification"]
+
+
+def test_score_run_includes_skill_eval_rubric_criteria(tmp_path: Path) -> None:
+    case = _fake_case(tmp_path, "skill-eval-case")
+    rubric = case.root / "eval_rubric.yaml"
+    rubric.write_text(
+        "\n".join(
+            [
+                "result_weight: 80",
+                "process_weight: 20",
+                "expected_output: Agent explains the expected behavior.",
+                "criteria:",
+                "  - assertion: output contains lifecycle invariant",
+                "  - assertion: output names verification command",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    run_root = tmp_path / "runs" / "skill-eval-case-001"
+    _write_fake_evidence(run_root)
+    (run_root / "completion_report.md").write_text(
+        "status: completed\nverification: pytest passed\n",
+        encoding="utf-8",
+    )
+    run = ReplayRun(
+        id="skill-eval-case-001",
+        root=run_root,
+        case=case,
+        runner_label="agent",
+        workspace=tmp_path / "workspace",
+    )
+
+    scoring_package = score_run(run, rubric_path=None)
+    text = scoring_package.read_text(encoding="utf-8")
+
+    assert "Agent explains the expected behavior." in text
+    assert "assertion: output contains lifecycle invariant" in text
+    assert "assertion: output names verification command" in text
+
+
+def test_dedupe_eval_cases_does_not_remove_symlinked_case_dirs(tmp_path: Path) -> None:
+    cases_root = tmp_path / "cases"
+    cases_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    symlink_case = cases_root / "demo-eval1-bbbb"
+    try:
+        symlink_case.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+    keep = cases_root / "demo-eval1-aaaa"
+    keep.mkdir()
+
+    removed = dedupe_eval_cases(cases_root)
+
+    assert removed == []
+    assert outside.exists()
+    assert symlink_case.is_symlink()
+    assert keep.exists()
 
 
 # =========================================================================

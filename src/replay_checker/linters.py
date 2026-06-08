@@ -4,6 +4,7 @@ import os
 import re
 from pathlib import Path
 
+from .core import Diagnostic
 from .replay import parse_simple_yaml
 
 
@@ -22,13 +23,13 @@ def _safe_is_file(path: Path) -> bool:
     return path.name in os.listdir(parent)
 
 
-def lint_task(run_root: Path) -> list[str]:
+def lint_task(run_root: Path) -> list[Diagnostic]:
     """Validate a task package directory for structural completeness.
 
     Checks run-level (TASK.md) and case-level (task.md) independently.
-    Returns a list of diagnostic strings (empty = lint clean).
+    Returns a list of Diagnostic objects (empty = lint clean).
     """
-    diagnostics: list[str] = []
+    diagnostics: list[Diagnostic] = []
 
     task_path = run_root / "TASK.md"
     case_path = run_root / "task.md"
@@ -37,100 +38,78 @@ def lint_task(run_root: Path) -> list[str]:
     has_case_task = _safe_is_file(case_path)
 
     if not has_run_task and not has_case_task:
-        diagnostics.append("missing task file: no TASK.md or task.md found in directory")
+        diagnostics.append(Diagnostic("error", "missing.task_file", "missing task file: no TASK.md or task.md found in directory"))
         return diagnostics
 
     if has_run_task:
         content = task_path.read_text(encoding="utf-8", errors="ignore")
 
         if "Protocol Version:" not in content:
-            diagnostics.append("missing protocol version: no 'Protocol Version:' line found in TASK.md")
+            diagnostics.append(Diagnostic("error", "missing.protocol_version", "missing protocol version: no 'Protocol Version:' line found in TASK.md"))
 
         if not _has_heading_content(content, ("goal", "source", "reconstructed task")):
-            diagnostics.append("no goal or source statement: expected a goal, source, or reconstructed task section")
+            diagnostics.append(Diagnostic("error", "missing.goal_or_source", "no goal or source statement: expected a goal, source, or reconstructed task section"))
 
         if "## Agent Output Contract" not in content:
-            diagnostics.append(
-                "missing output contract: TASK.md should contain '## Agent Output Contract' section"
-            )
+            diagnostics.append(Diagnostic("error", "missing.output_contract", "missing output contract: TASK.md should contain '## Agent Output Contract' section"))
 
         if "## Forbidden Access" not in content:
-            diagnostics.append("missing forbidden access section: TASK.md should contain '## Forbidden Access' section")
+            diagnostics.append(Diagnostic("error", "missing.forbidden_access", "missing forbidden access section: TASK.md should contain '## Forbidden Access' section"))
 
         if "## Evidence Requirements" not in content:
-            diagnostics.append(
-                "missing evidence requirements section: TASK.md should contain '## Evidence Requirements' section"
-            )
+            diagnostics.append(Diagnostic("error", "missing.evidence_requirements", "missing evidence requirements section: TASK.md should contain '## Evidence Requirements' section"))
 
         if not _has_completion_report(content):
-            diagnostics.append(
-                "missing completion report schema: TASK.md should reference a "
-                "completion_report file or contain a '## Completion Report' section"
-            )
+            diagnostics.append(Diagnostic("error", "missing.completion_report_schema", "missing completion report schema: TASK.md should reference a completion_report file or contain a '## Completion Report' section"))
 
         if _references_leaked(content):
-            diagnostics.append(
-                "reference leak: task file contains leaked _reference/ content "
-                "(diff/patch data) that must not be visible to the executing agent"
-            )
+            diagnostics.append(Diagnostic("error", "security.reference_leak", "reference leak: task file contains leaked _reference/ content (diff/patch data) that must not be visible to the executing agent"))
 
         if "## Verification Commands" in content:
             for entry in _extract_verification_entries(content):
                 if _looks_like_prose(entry):
-                    diagnostics.append(
-                        f"non-command verification entry: '{entry}' "
-                        "under ## Verification Commands is not a runnable shell command"
-                    )
+                    diagnostics.append(Diagnostic("warning", "content.prose_verification", f"non-command verification entry: '{entry}' under ## Verification Commands is not a runnable shell command"))
 
         # Goal quality check
         if "## Goal" in content:
             goal_text = content.split("## Goal")[1].split("##")[0].strip()
             if len(goal_text) < 20:
-                diagnostics.append(
-                    f"goal 过于简略：{len(goal_text)} 字符（建议 ≥20）"
-                )
+                diagnostics.append(Diagnostic("warning", "content.goal_too_short", f"goal 过于简略：{len(goal_text)} 字符（建议 ≥20）"))
             if _is_template_goal(goal_text):
-                diagnostics.append(
-                    "template goal detected: the goal is the default package-compiler "
-                    "template — the case was likely generated without extracting a "
-                    "concrete task description from the source plan"
-                )
+                diagnostics.append(Diagnostic("warning", "content.template_goal", "template goal detected: the goal is the default package-compiler template — the case was likely generated without extracting a concrete task description from the source plan"))
         elif "## Goal" not in content and "## Source" not in content:
-            diagnostics.append("no goal or source section found in TASK.md")
+            diagnostics.append(Diagnostic("error", "missing.goal_or_source", "no goal or source section found in TASK.md"))
 
     if has_case_task:
         case_content = case_path.read_text(encoding="utf-8", errors="ignore")
 
         if not _has_heading_content(case_content, ("source", "reconstructed task", "goal")):
-            diagnostics.append("case task.md has no source or goal statement")
+            diagnostics.append(Diagnostic("error", "missing.goal_or_source", "case task.md has no source or goal statement"))
 
         if _has_base_commit(case_path):
             base = _read_base_commit(case_path)
             if base and not _is_valid_base(base):
-                diagnostics.append(f"base_commit in case.yaml is invalid: {base}")
+                diagnostics.append(Diagnostic("error", "content.invalid_base_commit", f"base_commit in case.yaml is invalid: {base}"))
 
         if _references_leaked(case_content):
-            diagnostics.append(
-                "reference leak: case task.md contains leaked _reference/ content "
-                "(diff/patch data) that must not be visible to the executing agent"
-            )
+            diagnostics.append(Diagnostic("error", "security.reference_leak", "reference leak: case task.md contains leaked _reference/ content (diff/patch data) that must not be visible to the executing agent"))
 
     return diagnostics
 
 
-def lint_score(run_root: Path) -> list[str]:
+def lint_score(run_root: Path) -> list[Diagnostic]:
     """Validate a scoring package for structural completeness.
 
     Checks scoring_package.md and run.yaml for required sections
     and detects runner label leakage.
 
-    Returns a list of diagnostic strings (empty = lint clean).
+    Returns a list of Diagnostic objects (empty = lint clean).
     """
-    diagnostics: list[str] = []
+    diagnostics: list[Diagnostic] = []
 
     scoring_path = run_root / "scoring_package.md"
     if not scoring_path.is_file():
-        diagnostics.append("missing scoring_package.md")
+        diagnostics.append(Diagnostic("error", "missing.scoring_package", "missing scoring_package.md"))
         return diagnostics
 
     content = scoring_path.read_text(encoding="utf-8", errors="ignore")
@@ -138,45 +117,30 @@ def lint_score(run_root: Path) -> list[str]:
     has_run_yaml = run_yaml_path.is_file()
 
     if "Protocol Version:" not in content:
-        diagnostics.append("missing protocol version: no 'Protocol Version:' line found in scoring package")
+        diagnostics.append(Diagnostic("error", "missing.protocol_version", "missing protocol version: no 'Protocol Version:' line found in scoring package"))
 
     if "## Required Inputs" not in content:
-        diagnostics.append(
-            "missing evidence gate: scoring package should contain '## Required Inputs' section"
-        )
+        diagnostics.append(Diagnostic("error", "missing.required_inputs", "missing evidence gate: scoring package should contain '## Required Inputs' section"))
 
     if "## Rubric Weights" not in content:
-        diagnostics.append(
-            "missing score ceilings: scoring package should contain '## Rubric Weights' section"
-        )
+        diagnostics.append(Diagnostic("error", "missing.rubric_weights", "missing score ceilings: scoring package should contain '## Rubric Weights' section"))
 
     if "## Invalid Score Conditions" not in content:
-        diagnostics.append(
-            "missing invalid score conditions: "
-            "scoring package should contain '## Invalid Score Conditions' section"
-        )
+        diagnostics.append(Diagnostic("error", "missing.invalid_conditions", "missing invalid score conditions: scoring package should contain '## Invalid Score Conditions' section"))
 
     if has_run_yaml:
         runner_label = parse_simple_yaml(run_yaml_path).get("runner_label", "")
         if runner_label and str(runner_label) in content:
-            diagnostics.append(
-                f"runner label leakage: '{runner_label}' found in scoring package; "
-                "runner identity must be anonymized"
-            )
+            diagnostics.append(Diagnostic("error", "security.runner_label_leak", f"runner label leakage: '{runner_label}' found in scoring package; runner identity must be anonymized"))
 
     if "## Evidence References" not in content:
-        diagnostics.append(
-            "missing evidence references: scoring package should contain '## Evidence References' section"
-        )
+        diagnostics.append(Diagnostic("error", "missing.evidence_references", "missing evidence references: scoring package should contain '## Evidence References' section"))
 
     # Check provenance for non-manual cases
     is_manual = _scoring_package_is_manual(content, run_root)
     if not is_manual:
         if "## Case Provenance & Source Risk" not in content:
-            diagnostics.append(
-                "missing case provenance: non-manual scoring package should contain "
-                "'## Case Provenance & Source Risk' section"
-            )
+            diagnostics.append(Diagnostic("error", "missing.case_provenance", "missing case provenance: non-manual scoring package should contain '## Case Provenance & Source Risk' section"))
         else:
             _check_provenance_content(content, diagnostics)
 
@@ -279,20 +243,20 @@ def _scoring_package_is_manual(content: str, run_root: Path) -> bool:
     return False
 
 
-def _check_provenance_content(content: str, diagnostics: list[str]) -> None:
+def _check_provenance_content(content: str, diagnostics: list[Diagnostic]) -> None:
     """Validate provenance section content in scoring package."""
     required_fields = [
-        ("Primary source type", "missing primary source type in provenance section"),
-        ("Base commit source", "missing base commit source in provenance section"),
-        ("Merged confidence", "missing merged confidence in provenance section"),
-        ("Overall risk level", "missing overall risk level in provenance section"),
+        ("Primary source type", "missing.primary_source_type", "missing primary source type in provenance section"),
+        ("Base commit source", "missing.base_commit_source", "missing base commit source in provenance section"),
+        ("Merged confidence", "missing.merged_confidence", "missing merged confidence in provenance section"),
+        ("Overall risk level", "missing.overall_risk_level", "missing overall risk level in provenance section"),
     ]
-    for field, message in required_fields:
+    for field, code, message in required_fields:
         if field not in content:
-            diagnostics.append(message)
+            diagnostics.append(Diagnostic("error", code, message))
 
 
-def _check_raw_log_leakage(content: str, diagnostics: list[str]) -> None:
+def _check_raw_log_leakage(content: str, diagnostics: list[Diagnostic]) -> None:
     """Detect raw conversation log content leaked into scoring package."""
     raw_indicators = [
         r'"role"\s*:\s*"user"',
@@ -302,14 +266,14 @@ def _check_raw_log_leakage(content: str, diagnostics: list[str]) -> None:
     ]
     for pattern in raw_indicators:
         if re.search(pattern, content):
-            diagnostics.append(
-                f"raw log leakage: scoring package contains raw conversation data "
-                f"(pattern: {pattern})"
-            )
+            diagnostics.append(Diagnostic(
+                "error", "security.raw_log_leak",
+                f"raw log leakage: scoring package contains raw conversation data (pattern: {pattern})",
+            ))
             break
 
 
-def _check_scoring_reference_leakage(content: str, diagnostics: list[str]) -> None:
+def _check_scoring_reference_leakage(content: str, diagnostics: list[Diagnostic]) -> None:
     """Detect reference/oracle content leaked into scoring package.
 
     _reference/ inside backticks (`_reference/`) is a policy/documentation
@@ -319,9 +283,10 @@ def _check_scoring_reference_leakage(content: str, diagnostics: list[str]) -> No
         line_stripped = line.strip().lower()
         # Bare _reference/ outside backticks is leakage
         if re.search(r"(?<!`)_reference[/\\]", line):
-            diagnostics.append(
-                "reference leak: scoring package contains leaked _reference/ content"
-            )
+            diagnostics.append(Diagnostic(
+                "error", "security.reference_leak",
+                "reference leak: scoring package contains leaked _reference/ content",
+            ))
             break
 
 
