@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
+from .evaluation import TaskOutcomeEntry
+from .outcome_feedback import feedback_acceptance_criteria, summarize_task_outcomes
+from .task_contracts import TaskPackageContract, default_execution_contract
 
 
 PROTOCOL_VERSION = "replay-checker-task-v2"
@@ -36,6 +40,7 @@ class ExecutionPackage:
     input_contract: InputContract
     output_contract: OutputContract
     runner_instructions: str
+    task_contract: TaskPackageContract
     verification_commands: tuple[str, ...] = ()
     conversation_evidence: str = ""
 
@@ -51,6 +56,7 @@ class ExecutionPackageCompiler:
         workspace: str,
         completion_template_path: str,
         verification_commands: tuple[str, ...] | list[str] = (),
+        task_outcomes: tuple[TaskOutcomeEntry, ...] | list[TaskOutcomeEntry] = (),
     ) -> None:
         self._run_id = run_id
         self._case_id = case_id
@@ -59,12 +65,23 @@ class ExecutionPackageCompiler:
         self._workspace = workspace
         self._completion_template_path = completion_template_path
         self._verification_commands = tuple(verification_commands)
+        self._task_outcomes = tuple(task_outcomes)
 
     def compile(self) -> ExecutionPackage:
+        goal = self._build_goal()
+        task_contract = default_execution_contract(
+            run_id=self._run_id,
+            goal=goal,
+            workspace=self._workspace,
+            case_task_path=self._case_task_path,
+            plan_path=self._plan_path,
+            verification_commands=self._verification_commands,
+        )
+        task_contract = self._apply_outcome_feedback(task_contract)
         return ExecutionPackage(
             protocol_version=PROTOCOL_VERSION,
             run_id=self._run_id,
-            goal=self._build_goal(),
+            goal=goal,
             starting_point=self._build_starting_point(),
             allowed_scope=self._build_allowed_scope(),
             expected_output=self._build_expected_output(),
@@ -84,7 +101,39 @@ class ExecutionPackageCompiler:
                 include_status_summary="status, summary, changed files, verification, and issues/notes",
             ),
             runner_instructions=self._build_runner_instructions(),
+            task_contract=task_contract,
             verification_commands=self._verification_commands,
+        )
+
+    def _apply_outcome_feedback(
+        self,
+        contract: TaskPackageContract,
+    ) -> TaskPackageContract:
+        feedback = summarize_task_outcomes(self._task_outcomes)
+        extra_acceptance = feedback_acceptance_criteria(feedback)
+        if not extra_acceptance:
+            return contract
+        return TaskPackageContract(
+            id=contract.id,
+            source_skill=contract.source_skill,
+            severity=contract.severity,
+            evidence=contract.evidence,
+            affected_paths=contract.affected_paths,
+            root_cause=contract.root_cause,
+            proposed_change=contract.proposed_change,
+            acceptance_criteria=contract.acceptance_criteria + extra_acceptance,
+            verification_commands=contract.verification_commands,
+            agent_capability=contract.agent_capability,
+            parallel_safety=contract.parallel_safety,
+            dependencies=contract.dependencies,
+            blocked_by=contract.blocked_by,
+            handoff_mode=contract.handoff_mode,
+            confidence=contract.confidence,
+            expected_user_value=(
+                contract.expected_user_value
+                + " Prior outcome feedback is used to harden acceptance criteria."
+            ),
+            falsification=contract.falsification,
         )
 
     def _build_goal(self) -> str:
@@ -176,6 +225,7 @@ class ExecutionPackageRenderer:
             self._completion_report_schema_section(pkg),
             self._forbidden_access_section(pkg),
             self._evidence_requirements_section(pkg),
+            self._task_contract_section(pkg),
             self._ambiguity_handling_section(pkg),
             self._verification_commands_section(pkg),
         ]
@@ -241,6 +291,14 @@ class ExecutionPackageRenderer:
         ]
         return "\n".join(lines) + "\n"
 
+    def _task_contract_section(self, pkg: ExecutionPackage) -> str:
+        return (
+            "## Task Package Contract\n"
+            "```yaml\n"
+            f"{pkg.task_contract.to_yaml()}\n"
+            "```\n"
+        )
+
     def _ambiguity_handling_section(self, pkg: ExecutionPackage) -> str:
         return f"## Ambiguity Handling\n{pkg.ambiguity_handling}\n"
 
@@ -265,6 +323,7 @@ def compile_execution_package(
     workspace: str,
     completion_template_path: str,
     verification_commands: tuple[str, ...] | list[str] = (),
+    task_outcomes: tuple[TaskOutcomeEntry, ...] | list[TaskOutcomeEntry] = (),
 ) -> ExecutionPackage:
     compiler = ExecutionPackageCompiler(
         run_id=run_id,
@@ -274,6 +333,7 @@ def compile_execution_package(
         workspace=workspace,
         completion_template_path=completion_template_path,
         verification_commands=verification_commands,
+        task_outcomes=task_outcomes,
     )
     return compiler.compile()
 

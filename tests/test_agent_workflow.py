@@ -29,6 +29,7 @@ from replay_checker.replay import (
     prepare_run,
     report_all_cases,
 )
+from replay_checker.wizard import wizard_preview
 import tools.project as project_tool
 from tools.replay import _print_preview
 
@@ -1168,3 +1169,14 @@ def test_wizard_preview_defaults_to_top_five_candidates(tmp_path: Path, capsys) 
     assert "5. candidate-4" in output
     assert "6. candidate-5" not in output
     assert "3 more candidate(s) hidden" in output
+
+
+def test_wizard_preview_uses_portable_commands(tmp_path: Path) -> None:
+    project = tmp_path / "target"
+    _init_project(project)
+
+    preview = wizard_preview(project, scope="demo")
+
+    assert preview.next_commands
+    assert all(command.startswith("python3 tools/replay.py ") for command in preview.next_commands)
+    assert not any(("r" + "tk ") in command for command in preview.next_commands)

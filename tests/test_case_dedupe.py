@@ -21,7 +21,7 @@ from replay_checker.case_dedupe import (
     scan_all_fingerprints,
 )
 from replay_checker.core import stable_hash
-from replay_checker.replay import _write_simple_yaml
+from replay_checker.yaml_lite import write_simple_yaml
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +58,7 @@ def _make_case(
         data["skill_name"] = skill_name
     if eval_id:
         data["eval_id"] = eval_id
-    _write_simple_yaml(case_dir / "case.yaml", data)
+    write_simple_yaml(case_dir / "case.yaml", data)
 
     # task.md
     (case_dir / "task.md").write_text(f"# Task: {case_id}\n\n{task_text}\n", encoding="utf-8")
@@ -73,7 +73,7 @@ def _make_case(
         if diff_content:
             (ref_dir / "diff.patch").write_text(diff_content, encoding="utf-8")
         if changed_files:
-            _write_simple_yaml(
+            write_simple_yaml(
                 ref_dir / "reference_metadata.yaml",
                 {
                     "target_commit": "def456",

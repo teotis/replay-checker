@@ -8,6 +8,7 @@ from pathlib import Path
 
 from ..candidates import CandidateCase
 from ..sources import EvidenceRecord
+from ..task_contracts import default_orchestration_contract
 
 # Fallback plan document search locations.  Generated kits never assume only
 # ``docs/plans``; agents are instructed to search the full list.
@@ -128,6 +129,21 @@ class SourceDiscoveryTemplate:
                 self.raw_log_prohibition,
                 "",
             ]
+
+        sections += [
+            "## Task Package Contract",
+            "",
+            "```yaml",
+            default_orchestration_contract(
+                package_id=self.package_id,
+                description=self.description,
+                allowed_paths=self.allowed_paths,
+                dependencies=(),
+                verification_commands=self.verification_commands,
+            ).to_yaml(),
+            "```",
+            "",
+        ]
 
         sections += [
             "## Verification Commands",

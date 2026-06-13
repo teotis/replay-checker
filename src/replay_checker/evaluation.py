@@ -187,6 +187,21 @@ class ScoreHistoryEntry:
 
 
 @dataclass
+class TaskOutcomeEntry:
+    """Outcome replay record for a generated task package."""
+
+    package_id: str
+    task_contract_id: str = ""
+    timestamp: str = ""
+    outcome: str = "unknown"
+    blocked_reason: str = ""
+    acceptance_gaps: tuple[str, ...] = ()
+    false_positive: bool = False
+    landed: bool = False
+    verification_status: str = "unknown"
+
+
+@dataclass
 class Recommendation:
     """Default user-facing recommendation stored in current/recommendation.yaml."""
 
@@ -629,6 +644,63 @@ def read_score_history(case_root: str | Path) -> list[ScoreHistoryEntry]:
                     for k, v in record.get("dimensions", {}).items()
                 },
                 recomputation_reason=str(record.get("recomputation_reason", "")),
+            )
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# task_outcomes.jsonl (at evaluation/ root, not under current/)
+# ---------------------------------------------------------------------------
+
+
+def append_task_outcome(
+    case_root: str | Path,
+    entry: TaskOutcomeEntry,
+) -> Path:
+    root = eval_dir(case_root)
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / "task_outcomes.jsonl"
+    record = {
+        "package_id": entry.package_id,
+        "task_contract_id": entry.task_contract_id,
+        "timestamp": entry.timestamp,
+        "outcome": entry.outcome,
+        "blocked_reason": entry.blocked_reason,
+        "acceptance_gaps": list(entry.acceptance_gaps),
+        "false_positive": entry.false_positive,
+        "landed": entry.landed,
+        "verification_status": entry.verification_status,
+    }
+    line = json.dumps(record, ensure_ascii=False, sort_keys=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+    return path
+
+
+def read_task_outcomes(case_root: str | Path) -> list[TaskOutcomeEntry]:
+    root = eval_dir(case_root)
+    path = root / "task_outcomes.jsonl"
+    if not path.exists():
+        return []
+    result: list[TaskOutcomeEntry] = []
+    for line in path.read_text(encoding="utf-8").rstrip("\n").splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        result.append(
+            TaskOutcomeEntry(
+                package_id=str(record.get("package_id", "")),
+                task_contract_id=str(record.get("task_contract_id", "")),
+                timestamp=str(record.get("timestamp", "")),
+                outcome=str(record.get("outcome", "unknown")),
+                blocked_reason=str(record.get("blocked_reason", "")),
+                acceptance_gaps=tuple(
+                    str(item) for item in record.get("acceptance_gaps", [])
+                ),
+                false_positive=bool(record.get("false_positive", False)),
+                landed=bool(record.get("landed", False)),
+                verification_status=str(record.get("verification_status", "unknown")),
             )
         )
     return result

@@ -12,7 +12,7 @@ from typing import Any
 from .case_paths import case_inventory_root
 from .core import sanitize_slug, stable_hash
 from .git_utils import git_output
-from .replay import _write_simple_yaml
+from .yaml_lite import write_simple_yaml
 
 
 @dataclass(frozen=True)
@@ -60,7 +60,7 @@ def write_skill_eval_case(eval_case: SkillEvalCase, cases_root: str | Path, skil
     base_commit, base_source, base_confidence = _repo_base(repo)
     evidence_sources = [f"skill_eval: {eval_case.skill_name} eval {eval_case.eval_id}"]
 
-    _write_simple_yaml(
+    write_simple_yaml(
         case_root / "case.yaml",
         {
             "id": case_id,
@@ -85,7 +85,7 @@ def write_skill_eval_case(eval_case: SkillEvalCase, cases_root: str | Path, skil
     )
     (case_root / "task.md").write_text(_build_task_md(eval_case), encoding="utf-8")
     (case_root / "evidence_sources.md").write_text(_build_evidence_sources_md(eval_case), encoding="utf-8")
-    _write_simple_yaml(case_root / "eval_rubric.yaml", generate_skill_rubric(eval_case))
+    write_simple_yaml(case_root / "eval_rubric.yaml", generate_skill_rubric(eval_case))
     return case_root
 
 

@@ -28,6 +28,7 @@ from replay_checker.replay import (  # noqa: E402
 from replay_checker.candidates import build_case_candidates, select_case_candidate  # noqa: E402
 from replay_checker.eval_adapter import load_skill_evals, write_skill_eval_case, dedupe_eval_cases  # noqa: E402
 from replay_checker.case_dedupe import inspect_duplicates  # noqa: E402
+from replay_checker.case_audit import audit_cases  # noqa: E402
 from replay_checker.sources import (  # noqa: E402
     EvidenceSourceConfig,
     discover_evidence_sources,
@@ -153,7 +154,7 @@ def cmd_prepare_run(args: argparse.Namespace) -> int:
     print(f"Prepared run: {run.root}")
     print(f"Workspace: {run.workspace}")
     print("Copy TASK.md into your chosen agent, then return and run:")
-    print(f"  rtk python3 tools/replay.py collect-run --run {run.id}")
+    print(f"  python3 tools/replay.py collect-run --run {run.id}")
     return 0
 
 
@@ -193,12 +194,12 @@ def cmd_intake(args: argparse.Namespace) -> int:
     print(f"Evidence sources: {len(case.evidence_sources)}")
     print()
     print("Next commands (copy-paste ready):")
-    print(f"  rtk python3 tools/replay.py prepare-run --case {case.id} --label \"<agent/model>\"")
+    print(f"  python3 tools/replay.py prepare-run --case {case.id} --label \"<agent/model>\"")
     print()
     print("After agent execution:")
-    print(f"  rtk python3 tools/replay.py collect-run --run <run-id>")
-    print(f"  rtk python3 tools/replay.py score-run --run <run-id>")
-    print(f"  rtk python3 tools/replay.py compare --case {case.id}")
+    print(f"  python3 tools/replay.py collect-run --run <run-id>")
+    print(f"  python3 tools/replay.py score-run --run <run-id>")
+    print(f"  python3 tools/replay.py compare --case {case.id}")
     return 0
 
 
@@ -224,7 +225,7 @@ def cmd_batch_intake(args: argparse.Namespace) -> int:
     print()
     print("Next steps:")
     print(f"  Review cases: ls {args.cases_root}/")
-    print(f"  Prepare a run: rtk python3 tools/replay.py prepare-run --case <case-id> --label \"<agent/model>\"")
+    print(f"  Prepare a run: python3 tools/replay.py prepare-run --case <case-id> --label \"<agent/model>\"")
     return 0
 
 
@@ -370,12 +371,12 @@ def cmd_wizard(args: argparse.Namespace) -> int:
                 print(f"Base: {case.base_commit[:12]} (confidence: {case.base_confidence})")
             print()
             print("Next commands (copy-paste ready):")
-            print(f"  rtk python3 tools/replay.py prepare-run --case {case.id} --label \"<agent/model>\"")
+            print(f"  python3 tools/replay.py prepare-run --case {case.id} --label \"<agent/model>\"")
             print()
             print("After agent execution:")
-            print(f"  rtk python3 tools/replay.py collect-run --run <run-id>")
-            print(f"  rtk python3 tools/replay.py score-run --run <run-id>")
-            print(f"  rtk python3 tools/replay.py compare --case {case.id}")
+            print(f"  python3 tools/replay.py collect-run --run <run-id>")
+            print(f"  python3 tools/replay.py score-run --run <run-id>")
+            print(f"  python3 tools/replay.py compare --case {case.id}")
             return 0
 
         result = wizard(
@@ -520,6 +521,35 @@ def cmd_inspect_duplicates(args: argparse.Namespace) -> int:
 
     if not exact and not likely:
         print("No duplicates found.")
+    return 0
+
+
+def cmd_audit_cases(args: argparse.Namespace) -> int:
+    report = audit_cases(
+        Path(args.cases_root),
+        prune_unusable=args.prune_unusable,
+        prune_low_confidence=args.prune_low_confidence,
+        prune_duplicates=args.prune_duplicates,
+        dry_run=args.dry_run,
+    )
+    action = "Would remove" if args.dry_run else "Removed"
+    print(f"Total cases scanned: {report.total_cases}")
+    print(f"Blocking cases: {len(report.blocking_case_ids)}")
+    print(f"Low-confidence cases: {len(report.low_confidence_case_ids)}")
+    print(f"Exact duplicate cases: {len(report.duplicate_case_ids)}")
+    print(f"{action} cases: {len(report.removed_case_ids)}")
+
+    if args.verbose and report.issues:
+        print()
+        print("Issues:")
+        for issue in report.issues:
+            print(f"  {issue.case_id}\t{issue.severity}\t{issue.code}\t{issue.message}")
+
+    if report.removed_case_ids:
+        print()
+        print(f"{action}:")
+        for case_id in report.removed_case_ids:
+            print(f"  {case_id}")
     return 0
 
 
@@ -703,6 +733,24 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_dup.add_argument("--cases-root", default="cases",
                              help="cases directory root to scan")
     inspect_dup.set_defaults(func=cmd_inspect_duplicates)
+
+    audit_cases_parser = sub.add_parser(
+        "audit-cases",
+        help="audit case inventory quality and optionally prune policy failures",
+    )
+    audit_cases_parser.add_argument("--cases-root", default="cases",
+                                    help="cases directory root to scan")
+    audit_cases_parser.add_argument("--prune-unusable", action="store_true", default=False,
+                                    help="remove cases with blocking quality issues")
+    audit_cases_parser.add_argument("--prune-low-confidence", action="store_true", default=False,
+                                    help="remove cases whose base_confidence is low")
+    audit_cases_parser.add_argument("--prune-duplicates", action="store_true", default=False,
+                                    help="remove exact duplicate cases")
+    audit_cases_parser.add_argument("--dry-run", action="store_true", default=False,
+                                    help="show removals without deleting")
+    audit_cases_parser.add_argument("--verbose", action="store_true", default=False,
+                                    help="print per-case audit issues")
+    audit_cases_parser.set_defaults(func=cmd_audit_cases)
 
     wizard_parser = sub.add_parser("wizard", help="interactive case discovery wizard")
     wizard_parser.add_argument("--project", required=True, help="path to the target project")

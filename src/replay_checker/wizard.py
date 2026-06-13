@@ -237,9 +237,9 @@ def wizard_preview(
             risks.extend(top.risks)
 
     next_commands = [
-        f"rtk python3 tools/replay.py wizard --project {project} --scope \"{scope_text or 'your scope here'}\"",
-        f"rtk python3 tools/replay.py intake --project {project}",
-        f"rtk python3 tools/replay.py wizard --project {project} --scope \"{scope_text or 'your scope here'}\" --execute-local --no-interactive",
+        f"python3 tools/replay.py wizard --project {project} --scope \"{scope_text or 'your scope here'}\"",
+        f"python3 tools/replay.py intake --project {project}",
+        f"python3 tools/replay.py wizard --project {project} --scope \"{scope_text or 'your scope here'}\" --execute-local --no-interactive",
     ]
 
     return WizardPreview(

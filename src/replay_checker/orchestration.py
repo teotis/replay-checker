@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .discovery import DiscoveryKitConfig, DiscoveryPackage, SourceDiscoveryTemplate, source_template_map
+from .task_contracts import default_orchestration_contract
 
 
 GRAPH_HEADER = "package_id\tpackage_doc\tstatus_file\tdependencies\tdependency_type\twave\tbranch\tworktree\tmanual\tfinalize"
@@ -203,6 +204,19 @@ def generate_package_doc(pkg: DiscoveryPackage) -> str:
     for p in pkg.forbidden_paths:
         lines.append(f"- `{p}`")
     lines += [
+        "",
+        "## Task Package Contract",
+        "",
+        "```yaml",
+        default_orchestration_contract(
+            package_id=pkg.package_id,
+            description=pkg.description,
+            allowed_paths=pkg.allowed_paths,
+            dependencies=pkg.dependencies,
+            verification_commands=pkg.verification_commands,
+            is_manual=pkg.is_manual,
+        ).to_yaml(),
+        "```",
         "",
         "## Verification Commands",
         "",

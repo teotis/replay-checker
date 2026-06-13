@@ -1,4 +1,10 @@
-"""Evidence validity gates and score ceiling rules for Replay Checker scoring."""
+"""Evidence validity gates, score ceiling rules, and canonical run evaluation.
+
+The canonical ``RunEvaluation`` is the single immutable snapshot that captures
+gate results, score ceilings, invalidity, and result-evidence blocking for a
+single run.  ``evaluate_run()`` produces one from a run's evidence directory
+without persisting or memoizing anything.
+"""
 
 from __future__ import annotations
 
@@ -189,6 +195,177 @@ def parse_rubric(path: Path) -> dict[str, Any]:
         parse_inline_lists=True,
     )
     return data if isinstance(data, dict) else {}
+
+
+# ---------------------------------------------------------------------------
+# Canonical RunEvaluation snapshot
+# ---------------------------------------------------------------------------
+
+
+class RunEvaluation:
+    """Immutable snapshot of a run's evidence gate and ceiling evaluation.
+
+    Tuple-backed: all mutable containers are stored as tuples, and __hash__
+    is defined so that two evaluations of identical inputs compare equal.
+    """
+
+    __slots__ = (
+        "run_id",
+        "_gate_results",
+        "all_gates_passed",
+        "_score_ceilings",
+        "is_invalid",
+        "_invalid_reasons",
+        "result_evidence_blocked",
+        "_changed_files",
+    )
+
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        gate_results: tuple[GateResult, ...],
+        all_gates_passed: bool,
+        score_ceilings: ScoreCeilings,
+        is_invalid: bool,
+        invalid_reasons: tuple[str, ...],
+        result_evidence_blocked: bool,
+        changed_files: tuple[str, ...],
+    ) -> None:
+        object.__setattr__(self, "run_id", run_id)
+        object.__setattr__(self, "_gate_results", gate_results)
+        object.__setattr__(self, "all_gates_passed", all_gates_passed)
+        object.__setattr__(self, "_score_ceilings", score_ceilings)
+        object.__setattr__(self, "is_invalid", is_invalid)
+        object.__setattr__(self, "_invalid_reasons", invalid_reasons)
+        object.__setattr__(self, "result_evidence_blocked", result_evidence_blocked)
+        object.__setattr__(self, "_changed_files", changed_files)
+
+    # -- read-only properties ------------------------------------------------
+
+    @property
+    def gate_results(self) -> tuple[GateResult, ...]:
+        return self._gate_results
+
+    @property
+    def invalid_reasons(self) -> tuple[str, ...]:
+        return self._invalid_reasons
+
+    @property
+    def changed_files(self) -> tuple[str, ...]:
+        return self._changed_files
+
+    @property
+    def result_ceiling(self) -> float | None:
+        return self._score_ceilings.result_ceiling
+
+    @property
+    def process_ceiling(self) -> float | None:
+        return self._score_ceilings.process_ceiling
+
+    @property
+    def verification_ceiling(self) -> float | None:
+        return self._score_ceilings.verification_ceiling
+
+    @property
+    def overall_invalid(self) -> bool:
+        return self._score_ceilings.overall_invalid
+
+    @property
+    def ceiling_reasons(self) -> tuple[str, ...]:
+        return tuple(self._score_ceilings.reasons)
+
+    # -- immutability --------------------------------------------------------
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError(f"RunEvaluation is immutable (tried to set {name!r})")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError(f"RunEvaluation is immutable (tried to delete {name!r})")
+
+    # -- equality and hashing ------------------------------------------------
+
+    def _key(self) -> tuple[object, ...]:
+        gate_key = tuple((r.gate, r.passed, r.detail) for r in self._gate_results)
+        return (
+            self.run_id,
+            gate_key,
+            self.all_gates_passed,
+            (
+                self._score_ceilings.result_ceiling,
+                self._score_ceilings.process_ceiling,
+                self._score_ceilings.verification_ceiling,
+                self._score_ceilings.overall_invalid,
+                tuple(self._score_ceilings.reasons),
+            ),
+            self.is_invalid,
+            self._invalid_reasons,
+            self.result_evidence_blocked,
+            self._changed_files,
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, RunEvaluation):
+            return NotImplemented
+        return self._key() == other._key()
+
+    def __hash__(self) -> int:
+        return hash(self._key())
+
+    def __repr__(self) -> str:
+        return (
+            f"RunEvaluation(run_id={self.run_id!r}, "
+            f"all_gates_passed={self.all_gates_passed}, "
+            f"is_invalid={self.is_invalid}, "
+            f"result_evidence_blocked={self.result_evidence_blocked})"
+        )
+
+
+def evaluate_run(
+    *,
+    evidence_root: Path,
+    run_id: str,
+    runner_label: str | None = None,
+    changed_files: list[str] | None = None,
+) -> RunEvaluation:
+    """Evaluate a run's evidence and return an immutable RunEvaluation snapshot.
+
+    Reads evidence once, composes the existing gate and ceiling policy, and
+    determines result-evidence blocking.  Does not persist or create any files.
+
+    Args:
+        evidence_root: Path to the run root (contains evidence/ and completion_report.md).
+        run_id: Run identifier.
+        runner_label: Optional runner label for identity checks.
+        changed_files: Changed files from evidence.yaml; if None, an empty list is used.
+
+    Returns:
+        An immutable RunEvaluation capturing the complete evaluation state.
+    """
+    gate_eval = evaluate_evidence_gates(
+        evidence_root=evidence_root,
+        run_id=run_id,
+        runner_label=runner_label,
+        changed_files=changed_files,
+    )
+    ceilings = compute_score_ceilings(gate_eval)
+
+    has_diff = any(
+        r.gate == EvidenceGate.DIFF_PRESENT and r.passed
+        for r in gate_eval.results
+    )
+    result_evidence_blocked = ceilings.result_ceiling == 0.0 or not changed_files
+
+    return RunEvaluation(
+        run_id=run_id,
+        gate_results=tuple(gate_eval.results),
+        all_gates_passed=gate_eval.all_passed,
+        score_ceilings=ceilings,
+        is_invalid=gate_eval.is_invalid,
+        invalid_reasons=tuple(gate_eval.invalid_reasons),
+        result_evidence_blocked=result_evidence_blocked,
+        changed_files=tuple(changed_files or ()),
+    )
 
 
 # ---------------------------------------------------------------------------

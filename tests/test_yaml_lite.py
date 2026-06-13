@@ -8,6 +8,7 @@ from replay_checker.yaml_lite import (
     coerce_nested_int,
     emit_yaml,
     parse_yaml_text,
+    write_simple_yaml,
 )
 
 
@@ -107,3 +108,35 @@ def test_git_output_returns_empty_string_on_failure(monkeypatch):
     monkeypatch.setattr("replay_checker.git_utils.subprocess.run", fake_run)
 
     assert git_output(["status"], cwd="/repo") == ""
+
+
+def test_write_simple_yaml_creates_parents_and_writes_atomically(tmp_path):
+    target = tmp_path / "sub" / "dir" / "out.yaml"
+    write_simple_yaml(target, {"key": "value", "num": 42})
+
+    assert target.exists()
+    content = target.read_text(encoding="utf-8")
+    assert "key: value" in content
+    assert "num: 42" in content
+
+
+def test_write_simple_yaml_round_trips_complex_shapes(tmp_path):
+    data = {
+        "id": "case-1",
+        "flag": True,
+        "score": 12.5,
+        "tags": ["a", "b"],
+        "nested": {"x": 1, "y": 2},
+    }
+    path = tmp_path / "complex.yaml"
+    write_simple_yaml(path, data)
+
+    parsed = parse_yaml_text(
+        path.read_text(encoding="utf-8"),
+        scalar_parser=coerce_bool_int,
+    )
+    assert parsed["id"] == "case-1"
+    assert parsed["flag"] is True
+    assert parsed["score"] == "12.5"
+    assert parsed["tags"] == ["a", "b"]
+    assert parsed["nested"] == {"x": 1, "y": 2}

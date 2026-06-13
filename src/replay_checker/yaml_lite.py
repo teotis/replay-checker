@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
+from .core import atomic_write_text
+
 ScalarParser = Callable[[str, tuple[Any, ...]], Any]
 
 
@@ -313,6 +315,14 @@ def parse_simple_yaml(path: str | Path) -> dict[str, object]:
         parse_list_item_dicts=False,
     )
     return data if isinstance(data, dict) else {}
+
+
+def write_simple_yaml(path: Path, data: dict[str, object], *, indent: int = 0) -> None:
+    """Atomically write a dict as a simple YAML file.
+
+    Creates parent directories and writes via temp-file-rename for crash safety.
+    """
+    atomic_write_text(path, emit_yaml(data, indent=indent) + "\n")
 
 
 def _emit_dict_as_list_item(

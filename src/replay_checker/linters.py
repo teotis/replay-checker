@@ -5,7 +5,8 @@ import re
 from pathlib import Path
 
 from .core import Diagnostic
-from .replay import parse_simple_yaml
+from .task_contracts import validate_task_contract_yaml
+from .yaml_lite import parse_simple_yaml
 
 
 def _safe_is_file(path: Path) -> bool:
@@ -62,6 +63,8 @@ def lint_task(run_root: Path) -> list[Diagnostic]:
         if not _has_completion_report(content):
             diagnostics.append(Diagnostic("error", "missing.completion_report_schema", "missing completion report schema: TASK.md should reference a completion_report file or contain a '## Completion Report' section"))
 
+        _check_task_depth_sections(content, diagnostics)
+
         if _references_leaked(content):
             diagnostics.append(Diagnostic("error", "security.reference_leak", "reference leak: task file contains leaked _reference/ content (diff/patch data) that must not be visible to the executing agent"))
 
@@ -69,6 +72,10 @@ def lint_task(run_root: Path) -> list[Diagnostic]:
             for entry in _extract_verification_entries(content):
                 if _looks_like_prose(entry):
                     diagnostics.append(Diagnostic("warning", "content.prose_verification", f"non-command verification entry: '{entry}' under ## Verification Commands is not a runnable shell command"))
+
+        contract_yaml = _extract_task_contract_yaml(content)
+        if contract_yaml:
+            diagnostics.extend(validate_task_contract_yaml(contract_yaml))
 
         # Goal quality check
         if "## Goal" in content:
@@ -85,6 +92,8 @@ def lint_task(run_root: Path) -> list[Diagnostic]:
 
         if not _has_heading_content(case_content, ("source", "reconstructed task", "goal")):
             diagnostics.append(Diagnostic("error", "missing.goal_or_source", "case task.md has no source or goal statement"))
+
+        _check_task_depth_sections(case_content, diagnostics)
 
         if _has_base_commit(case_path):
             base = _read_base_commit(case_path)
@@ -127,6 +136,14 @@ def lint_score(run_root: Path) -> list[Diagnostic]:
 
     if "## Invalid Score Conditions" not in content:
         diagnostics.append(Diagnostic("error", "missing.invalid_conditions", "missing invalid score conditions: scoring package should contain '## Invalid Score Conditions' section"))
+
+    # Require evidence gate assessment section (projection from evaluate_run)
+    if "## Evidence Gate Assessment" not in content:
+        diagnostics.append(Diagnostic("error", "missing.gate_assessment", "missing evidence gate assessment: scoring package should contain '## Evidence Gate Assessment' section"))
+
+    # Validate ceiling projection structure when present
+    if "## Score Ceilings" in content:
+        _check_ceiling_projection(content, diagnostics)
 
     if has_run_yaml:
         runner_label = parse_simple_yaml(run_yaml_path).get("runner_label", "")
@@ -177,6 +194,17 @@ def _has_completion_report(content: str) -> bool:
     if "## completion report" in content.lower():
         return True
     return False
+
+
+def _check_task_depth_sections(content: str, diagnostics: list[Diagnostic]) -> None:
+    """Warn when generated task packages lack situation-depth sections."""
+
+    if "## Situation Context" not in content:
+        diagnostics.append(Diagnostic("warning", "depth.missing_situation_context", "task package lacks situation context extracted from project evidence"))
+    if "## Failure Boundaries" not in content:
+        diagnostics.append(Diagnostic("warning", "depth.missing_failure_boundaries", "task package lacks failure boundaries or false-positive risks"))
+    if "## Observable Acceptance Signals" not in content:
+        diagnostics.append(Diagnostic("warning", "depth.missing_observable_acceptance", "task package lacks observable acceptance signals"))
 
 
 def _references_leaked(content: str) -> bool:
@@ -231,6 +259,31 @@ def _extract_verification_entries(content: str) -> list[str]:
             if entry:
                 entries.append(entry)
     return entries
+
+
+def _extract_task_contract_yaml(content: str) -> str:
+    """Extract fenced YAML under ## Task Package Contract, if present."""
+    lines = content.splitlines()
+    in_section = False
+    in_fence = False
+    collected: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.lower() == "## task package contract":
+            in_section = True
+            continue
+        if in_section and not in_fence and stripped.startswith("## "):
+            break
+        if not in_section:
+            continue
+        if stripped.startswith("```"):
+            if not in_fence:
+                in_fence = True
+                continue
+            break
+        if in_fence:
+            collected.append(line)
+    return "\n".join(collected).strip()
 
 
 def _scoring_package_is_manual(content: str, run_root: Path) -> bool:
@@ -351,3 +404,33 @@ def _looks_like_prose(text: str) -> bool:
         return True
 
     return False
+
+
+def _check_ceiling_projection(content: str, diagnostics: list[Diagnostic]) -> None:
+    """Validate the structure of the ## Score Ceilings section.
+
+    Checks that at least one numeric ceiling value appears (result, process,
+    or verification) and that reasons follow ceiling lines.  This is a
+    static structural check — no runtime evaluation is performed.
+    """
+    in_ceiling = False
+    has_ceiling_value = False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped == "## Score Ceilings":
+            in_ceiling = True
+            continue
+        if in_ceiling and (stripped.startswith("## ") or stripped.startswith("# ")):
+            break
+        if in_ceiling and stripped.startswith("- Result score ceiling:"):
+            has_ceiling_value = True
+        elif in_ceiling and stripped.startswith("- Process score ceiling:"):
+            has_ceiling_value = True
+        elif in_ceiling and stripped.startswith("- Verification score ceiling:"):
+            has_ceiling_value = True
+
+    if not has_ceiling_value:
+        diagnostics.append(Diagnostic(
+            "error", "missing.ceiling_value",
+            "malformed score ceilings: ## Score Ceilings section present but contains no numeric ceiling value (expected at least one of result, process, or verification ceiling)",
+        ))

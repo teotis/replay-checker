@@ -20,12 +20,14 @@ from replay_checker.evaluation import (
     Recommendation,
     RunAttempt,
     ScoreHistoryEntry,
+    TaskOutcomeEntry,
     _comparison_filename,
     _compute_information_gain,
     _from_yaml,
     _group_ranking_by_band,
     _to_yaml,
     append_score_history,
+    append_task_outcome,
     build_comparison_queue,
     current_dir,
     eval_dir,
@@ -38,6 +40,7 @@ from replay_checker.evaluation import (
     read_recommendation,
     read_score_history,
     read_summary,
+    read_task_outcomes,
     recompute,
     snapshot_current,
     snapshots_dir,
@@ -394,6 +397,42 @@ def test_score_history_is_valid_jsonl(tmp_path):
     assert len(lines) == 1
     record = json.loads(lines[0])
     assert record["run_id"] == "r1"
+
+
+# ---------------------------------------------------------------------------
+# task_outcomes.jsonl tests
+# ---------------------------------------------------------------------------
+
+
+def test_task_outcome_append_and_read(tmp_path):
+    case = tmp_path / "case-1"
+    entry = TaskOutcomeEntry(
+        package_id="TP-1",
+        task_contract_id="TP-1",
+        timestamp="2026-06-14T00:00:00Z",
+        outcome="blocked",
+        blocked_reason="missing credentials",
+        acceptance_gaps=("verification command only proved importability",),
+        false_positive=False,
+        landed=False,
+        verification_status="not_run",
+    )
+
+    append_task_outcome(case, entry)
+    loaded = read_task_outcomes(case)
+
+    assert len(loaded) == 1
+    assert loaded[0].package_id == "TP-1"
+    assert loaded[0].outcome == "blocked"
+    assert loaded[0].blocked_reason == "missing credentials"
+    assert loaded[0].acceptance_gaps == (
+        "verification command only proved importability",
+    )
+    assert loaded[0].landed is False
+
+
+def test_task_outcomes_empty_when_missing(tmp_path):
+    assert read_task_outcomes(tmp_path / "case-1") == []
 
 
 # ---------------------------------------------------------------------------

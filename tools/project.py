@@ -277,7 +277,8 @@ def check_cases_complete(result: Result) -> None:
     try:
         from replay_checker.case_paths import iter_case_dirs
         from replay_checker.core import Diagnostic, format_diagnostics
-        from replay_checker.replay import load_case, validate_case
+        from replay_checker.case_intake import load_case
+        from replay_checker.case_validation import validate_case
     except Exception as exc:
         result.issues.append(f"cannot import case validator: {exc}")
         return
