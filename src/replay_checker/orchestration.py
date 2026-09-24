@@ -708,6 +708,7 @@ def generate_kit_files(
         "launchers/agent-prompts.md": generate_agent_prompts(packages, plan_root),
         "status/state.tsv": generate_state_tsv(packages),
         "status/events.jsonl": "",
+        "status/strict-evidence": "v1\n",
         "scratch/.gitignore": "*\n!.gitignore\n",
     }
 

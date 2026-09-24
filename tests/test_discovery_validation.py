@@ -120,3 +120,31 @@ def test_validate_kit_rejects_missing_package_doc_and_status_drift(tmp_path):
 
     assert "missing package doc: packages/02-merge.md" in errors
     assert "status file status/02-merge.md state `pending` disagrees with state.tsv `completed`" in errors
+
+
+def test_validate_kit_rejects_finalized_plan_without_completed_report(tmp_path):
+    kit = _write_kit(tmp_path)
+    (kit / "status" / "state.tsv").write_text(
+        STATE_HEADER
+        + "01-plan\tcompleted\t\t\t\t\t\t\t\tpassed\tpending\tremoved\t\t\t\t\t\n"
+        + "02-merge\tcompleted\t\t\t\t\t\t\t\tpassed\tpending\tremoved\t\t\t\t\t\n"
+        + "99-finalize\tfinalized\t\t\t\t\t\t\t\tpassed\tpending\tremoved\t\t\t\t\t\n",
+        encoding="utf-8",
+    )
+    for package_id, state in (
+        ("01-plan", "completed"),
+        ("02-merge", "completed"),
+        ("99-finalize", "finalized"),
+    ):
+        (kit / "status" / f"{package_id}.md").write_text(
+            f"# {package_id} Status\n\n## State\n\n`{state}`\n",
+            encoding="utf-8",
+        )
+    (kit / "FINAL_REPORT.md").write_text(
+        "# Final Report\n\n## Task-Level Outcome\n\npending\n",
+        encoding="utf-8",
+    )
+
+    errors = validate_kit(kit)
+
+    assert "finalized orchestration has an incomplete FINAL_REPORT.md" in errors

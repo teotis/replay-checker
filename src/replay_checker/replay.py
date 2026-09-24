@@ -35,6 +35,8 @@ from .run_ops import (  # noqa: F401
     inspect_run_dir,
     load_run,
     prepare_run,
+    prune_run_workspaces,
+    release_run_workspace,
     validate_case,
 )
 

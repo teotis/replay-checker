@@ -48,6 +48,9 @@ SENSITIVE_UNTRACKED_SUBSTRINGS = (
 IGNORED_UNTRACKED_FILENAMES = {
     "completion_report.md",
 }
+GENERATED_COPY_EXCLUDES = (
+    "runs", "reports", "work", "outputs", ".tmp", ".cache", "tmp",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -67,13 +70,49 @@ def _next_run_id(case_id: str, runs_root: Path) -> str:
     return f"{case_id}-{highest + 1:03d}"
 
 
+def _validate_path_component(value: str, *, label: str) -> None:
+    if not value or value in {".", ".."} or Path(value).name != value:
+        raise ValueError(f"{label} must be a single path component")
+
+
+def _resolve_run_root(runs_root: str | Path, run_id: str) -> Path:
+    _validate_path_component(run_id, label="run id")
+    root = Path(runs_root).resolve()
+    unresolved = root / run_id
+    if unresolved.is_symlink():
+        raise ValueError("run root must not be a symlink")
+    resolved = unresolved.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"run root is outside runs root: {resolved}") from exc
+    return resolved
+
+
 # ---------------------------------------------------------------------------
 # Workspace creation and fallback chain
 # ---------------------------------------------------------------------------
 
 
-def _cleanup_worktree(workspace: Path, project_path: str) -> None:
+def _require_workspace_within(run_root: Path, workspace: Path) -> Path:
+    resolved_root = run_root.resolve()
+    resolved_workspace = workspace.resolve()
+    try:
+        resolved_workspace.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"workspace is outside run root: {resolved_workspace}"
+        ) from exc
+    if resolved_workspace == resolved_root:
+        raise ValueError("workspace must not equal run root")
+    return resolved_workspace
+
+
+def _cleanup_worktree(
+    workspace: Path, project_path: str, *, run_root: Path
+) -> None:
     """Remove a git worktree and prune the parent repo's worktree metadata."""
+    workspace = _require_workspace_within(run_root, workspace)
     try:
         subprocess.run(
             ["git", "worktree", "remove", "--force", str(workspace)],
@@ -97,7 +136,7 @@ def _copy_project_tree(project_path: Path, workspace: Path) -> None:
         workspace,
         ignore=shutil.ignore_patterns(
             ".git", ".gitignore", "_reference", ".gradle", ".idea",
-            ".claude", ".worktrees", "build",
+            ".claude", ".worktrees", "build", *GENERATED_COPY_EXCLUDES,
         ),
         dirs_exist_ok=True,
         symlinks=True,
@@ -162,9 +201,10 @@ def _create_worktree(case: ReplayCase, workspace: Path) -> None:
     if not case.base_commit.strip():
         _copy_project_tree(case.project_path, workspace)
         return
+    abs_workspace = workspace.resolve()
     try:
         completed = git_run(
-            ["worktree", "add", "--detach", str(workspace), "--", case.base_commit],
+            ["worktree", "add", "--detach", str(abs_workspace), "--", case.base_commit],
             cwd=case.project_path,
             timeout=_GIT_TIMEOUT,
         )
@@ -263,19 +303,20 @@ def prepare_run(case: ReplayCase, *, runs_root: str | Path, runner_label: str) -
             f"Case {case.id} is incomplete — missing: {format_diagnostics(diagnostics, separator=', ')}. "
             "Required fields: base_source, base_confidence, source_type, source_path, selection_reason, evidence_sources.md"
         )
-    runs = Path(runs_root)
+    _validate_path_component(case.id, label="case id")
+    runs = Path(runs_root).resolve()
     runs.mkdir(parents=True, exist_ok=True)
     while True:
         run_id = _next_run_id(case.id, runs)
-        run_root = runs / run_id
+        run_root = _resolve_run_root(runs, run_id)
         workspace = run_root / "workspace"
         try:
             run_root.mkdir(parents=True, exist_ok=False)
             break
         except FileExistsError:
             continue
-    _create_worktree(case, workspace)
     try:
+        _create_worktree(case, workspace)
         run = ReplayRun(run_id, run_root, case, runner_label, workspace)
         write_simple_yaml(
             run_root / "run.yaml",
@@ -292,7 +333,7 @@ def prepare_run(case: ReplayCase, *, runs_root: str | Path, runner_label: str) -
         _write_completion_template(run)
         _write_run_task(run)
     except Exception:
-        _cleanup_worktree(workspace, case.project_path)
+        _cleanup_worktree(workspace, case.project_path, run_root=run_root)
         shutil.rmtree(run_root, ignore_errors=True)
         raise
     return run
@@ -336,7 +377,7 @@ def load_case(cases_root: str | Path, case_id: str) -> ReplayCase:
 
 
 def load_run(runs_root: str | Path, run_id: str, *, cases_root: str | Path) -> ReplayRun:
-    root = Path(runs_root) / run_id
+    root = _resolve_run_root(runs_root, run_id)
     run_yaml = root / "run.yaml"
     if not run_yaml.exists():
         raise FileNotFoundError(f"run.yaml not found at {run_yaml}")
@@ -373,6 +414,8 @@ def inspect_run_dir(run_root: str | Path) -> RunHealth:
         base = ""
     diff = ""
     changed_files: tuple[str, ...] = ()
+    evidence_yaml = root / "evidence" / "evidence.yaml"
+    released_workspace = str(data.get("workspace_released", "")).lower() in {"yes", "true", "1"}
     if workspace_exists:
         diff_ref = base
         if not diff_ref:
@@ -381,14 +424,25 @@ def inspect_run_dir(run_root: str | Path) -> RunHealth:
         diff = _git_capture(workspace, ["diff", diff_ref, "--binary"]) if diff_ref else _git_capture(workspace, ["diff", "--binary"])
         changed_output = _git_capture(workspace, ["diff", "--name-only", diff_ref]) if diff_ref else _git_capture(workspace, ["diff", "--name-only"])
         changed_files = tuple(f for f in changed_output.strip().splitlines() if f)
+    elif released_workspace and evidence_yaml.exists():
+        evidence = parse_simple_yaml(evidence_yaml)
+        raw_changed = evidence.get("changed_files", [])
+        if isinstance(raw_changed, list):
+            changed_files = tuple(str(f) for f in raw_changed if str(f).strip())
+        diff_path = root / "evidence" / "diff.patch"
+        diff = diff_path.read_text(encoding="utf-8") if diff_path.exists() else ""
 
+    has_result_diff = bool(diff.strip()) and bool(changed_files)
+    status_workspace_exists = workspace_exists or (released_workspace and evidence_yaml.exists())
     status, reason = _derive_canonical_run_status(
         raw_status=raw_status,
-        workspace_exists=workspace_exists,
+        workspace_exists=status_workspace_exists,
         completion_report_exists=completion.exists(),
-        has_result_diff=bool(diff.strip()) and bool(changed_files),
+        has_result_diff=has_result_diff,
         completion_text=_read_text_if_exists(completion),
     )
+    if released_workspace and evidence_yaml.exists() and not workspace_exists:
+        reason = f"workspace released after evidence collection; {reason}"
     return RunHealth(
         run_id=run_id,
         status=status,
@@ -396,7 +450,7 @@ def inspect_run_dir(run_root: str | Path) -> RunHealth:
         workspace=workspace,
         workspace_exists=workspace_exists,
         completion_report_exists=completion.exists(),
-        has_result_diff=bool(diff.strip()) and bool(changed_files),
+        has_result_diff=has_result_diff,
         changed_files=changed_files,
         reason=reason,
     )
@@ -419,10 +473,13 @@ def _resolve_workspace_path(run_root: Path, data: dict[str, object]) -> Path:
     raw = str(data.get("workspace", "workspace")).strip() or "workspace"
     workspace = Path(raw)
     if workspace.is_absolute():
-        return workspace
-    if raw.startswith("runs/") or raw.startswith("runs\\"):
-        return run_root.parent.parent / workspace
-    return run_root / workspace
+        candidate = workspace
+    elif raw.startswith("runs/") or raw.startswith("runs\\"):
+        candidate = run_root.parent.parent / workspace
+    else:
+        candidate = run_root / workspace
+
+    return _require_workspace_within(run_root, candidate)
 
 
 # ---------------------------------------------------------------------------
@@ -710,7 +767,80 @@ def _update_run_yaml_status(run_root: Path, health: RunHealth) -> None:
 # ---------------------------------------------------------------------------
 
 
-def collect_run(run: ReplayRun) -> Evidence:
+def _copy_completion_report_to_run_root(run: ReplayRun) -> None:
+    completion_ws = run.workspace / "completion_report.md"
+    completion_root = run.root / "completion_report.md"
+    if completion_ws.exists():
+        shutil.copy2(completion_ws, completion_root)
+
+
+def release_run_workspace(run: ReplayRun) -> bool:
+    """Release the execution workspace while preserving scorer-visible evidence."""
+    _copy_completion_report_to_run_root(run)
+    if not run.workspace.exists():
+        return False
+    _cleanup_worktree(
+        run.workspace, str(run.case.project_path), run_root=run.root
+    )
+    data = parse_simple_yaml(run.root / "run.yaml") if (run.root / "run.yaml").exists() else {}
+    data["workspace_released"] = "yes"
+    data["workspace_released_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    write_simple_yaml(run.root / "run.yaml", data)
+    _update_run_yaml_status(run.root, inspect_run_dir(run.root))
+    return True
+
+
+def prune_run_workspaces(
+    *,
+    runs_root: str | Path,
+    cases_root: str | Path,
+    runner_label: str | None = None,
+    include_prepared: bool = False,
+    dry_run: bool = True,
+) -> dict[str, int]:
+    """Prune eligible run workspaces while preserving run records."""
+    root = Path(runs_root)
+    result = {"scanned": 0, "eligible": 0, "pruned": 0, "errors": 0}
+    if not root.exists():
+        return result
+
+    for run_dir in sorted(path for path in root.iterdir() if path.is_dir() and (path / "run.yaml").exists()):
+        result["scanned"] += 1
+        data = parse_simple_yaml(run_dir / "run.yaml")
+        if runner_label is not None and str(data.get("runner_label", "")) != runner_label:
+            continue
+        workspace = _resolve_workspace_path(run_dir, data)
+        if not workspace.is_dir():
+            continue
+        evidence_exists = (run_dir / "evidence" / "evidence.yaml").exists()
+        status = str(data.get("status", "")).strip()
+        prepared_only = status == "prepared" and not evidence_exists
+        if not evidence_exists and not (include_prepared and prepared_only):
+            continue
+        result["eligible"] += 1
+        if dry_run:
+            continue
+        try:
+            run = load_run(root, run_dir.name, cases_root=cases_root)
+            if evidence_exists:
+                release_run_workspace(run)
+            else:
+                _cleanup_worktree(
+                    run.workspace, str(run.case.project_path), run_root=run.root
+                )
+                data["status"] = "pruned"
+                data["workspace_exists"] = "no"
+                data["workspace_pruned"] = "yes"
+                data["workspace_pruned_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                data["status_reason"] = "prepared-only workspace pruned before execution"
+                write_simple_yaml(run_dir / "run.yaml", data)
+            result["pruned"] += 1
+        except Exception:
+            result["errors"] += 1
+    return result
+
+
+def collect_run(run: ReplayRun, *, prune_workspace: bool = False) -> Evidence:
     evidence_dir = run.root / "evidence"
     evidence_dir.mkdir(parents=True, exist_ok=True)
     saved_base = _read_run_base(run) or run.case.base_commit
@@ -740,6 +870,7 @@ def collect_run(run: ReplayRun) -> Evidence:
     completion_ws = run.workspace / "completion_report.md"
     completion_legacy = run.root / "completion_report.md"
     completion = completion_ws if completion_ws.exists() else completion_legacy
+    _copy_completion_report_to_run_root(run)
     run_status = _completion_status(completion)
 
     missing: list[str] = []
@@ -763,5 +894,8 @@ def collect_run(run: ReplayRun) -> Evidence:
     }
     _write_telemetry_block(evidence_data, telemetry)
     write_simple_yaml(evidence_dir / "evidence.yaml", evidence_data)
-    _update_run_yaml_status(run.root, inspect_run_dir(run.root))
+    if prune_workspace:
+        release_run_workspace(run)
+    else:
+        _update_run_yaml_status(run.root, inspect_run_dir(run.root))
     return Evidence(run.id, run_status, changed_files, diff_path, tuple(missing))

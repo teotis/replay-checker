@@ -95,6 +95,16 @@ def validate_kit(plan_root: Path) -> list[str]:
                     f"status file {status_rel} state `{status_state}` disagrees with state.tsv `{state_rows[row['package_id']]['state']}`"
                 )
 
+    finalize_state = state_rows.get("99-finalize", {}).get("state")
+    if finalize_state == "finalized":
+        report_path = plan_root / "FINAL_REPORT.md"
+        if not report_path.is_file():
+            errors.append("finalized orchestration is missing FINAL_REPORT.md")
+        else:
+            report = report_path.read_text(encoding="utf-8", errors="ignore")
+            if re.search(r"(?im)^\s*(pending|\(pending\b)", report) or "Task-Level Outcome\n\npending" in report:
+                errors.append("finalized orchestration has an incomplete FINAL_REPORT.md")
+
     return errors
 
 

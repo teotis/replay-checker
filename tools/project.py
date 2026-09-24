@@ -332,6 +332,22 @@ def check_orchestration_states(result: Result) -> None:
             result.issues.append(
                 f"orchestration {plan_name} finalized while dependencies are incomplete: {', '.join(incomplete)}"
             )
+            continue
+        plan_root = state_file.parents[1]
+        if (plan_root / "status" / "strict-evidence").is_file():
+            try:
+                if str(ROOT / "src") not in sys.path:
+                    sys.path.insert(0, str(ROOT / "src"))
+                from replay_checker.discovery.validation import validate_kit
+                validation_errors = validate_kit(plan_root)
+            except Exception as exc:
+                validation_errors = [f"validation failed: {exc}"]
+            if validation_errors:
+                plan_name = plan_root.name
+                result.issues.append(
+                    f"orchestration {plan_name} finalized with invalid evidence: "
+                    + "; ".join(validation_errors)
+                )
 
     if checked:
         result.notices.append(f"orchestration finalized states checked: {checked}")

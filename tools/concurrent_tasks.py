@@ -29,6 +29,20 @@ MANIFEST_DIR = ROOT / "work"
 
 DEFAULT_MAX_CONCURRENCY = 8
 REPLAY_PY = ROOT / "tools" / "replay.py"
+PHASE_CONCURRENCY = {
+    "intake-lint": 8,
+    "prepare-run": 1,  # git worktree metadata is repository-global
+    "finalize": 1,
+}
+
+
+def phase_concurrency(phase: str, global_limit: int) -> int:
+    return max(1, min(global_limit, PHASE_CONCURRENCY.get(phase, global_limit)))
+
+
+def package_parallelism(phase: str, global_limit: int) -> int:
+    """Return package fan-out that keeps total subprocesses within the limit."""
+    return max(1, global_limit // phase_concurrency(phase, global_limit))
 
 
 @dataclass
@@ -129,21 +143,8 @@ def generate_manifest(args) -> Manifest:
         case_id = case_info["case_id"]
         case_path = Path(case_info["path"])
 
-        # Intake task
-        task_counter += 1
-        manifest.tasks.append(Task(
-            task_id=f"T{task_counter:04d}",
-            case_id=case_id,
-            project=project,
-            operation="intake",
-            args=[
-                sys.executable, str(REPLAY_PY), "intake",
-                "--project", str(case_path.parent),
-                "--cases-root", str(CASES_ROOT),
-            ],
-        ))
-
-        # Lint-task if case exists
+        # Existing inventory is audited in place; never intake the inventory
+        # bucket as though it were a source project.
         if (case_path / "case.yaml").exists():
             task_counter += 1
             manifest.tasks.append(Task(
@@ -153,21 +154,67 @@ def generate_manifest(args) -> Manifest:
                 operation="lint-task",
                 args=[
                     sys.executable, str(REPLAY_PY), "lint-task",
-                    "--case", case_id,
-                    "--cases-root", str(CASES_ROOT),
+                    "--run", str(case_path),
                 ],
             ))
 
     return manifest
 
 
-async def run_task(task: Task, semaphore: asyncio.Semaphore, manifest_path: Path):
+def compile_manifest_task(task: Task) -> list[str]:
+    """Validate a manifest task and return its canonical command."""
+    if task.operation != "lint-task":
+        raise ValueError(
+            f"manifest task is not an allowlisted operation: {task.operation}"
+        )
+    if not isinstance(task.args, list) or not all(
+        isinstance(arg, str) for arg in task.args
+    ):
+        raise ValueError("manifest task args are not an allowlisted command")
+    if len(task.args) != 5:
+        raise ValueError("manifest task args are not an allowlisted command")
+
+    executable, script, subcommand, flag, raw_case_path = task.args
+    expected_executable = Path(sys.executable).resolve()
+    if Path(executable).resolve() != expected_executable:
+        raise ValueError("manifest executable is not allowlisted")
+    if Path(script).resolve() != REPLAY_PY.resolve():
+        raise ValueError("manifest script is not allowlisted")
+    if subcommand != "lint-task" or flag != "--run":
+        raise ValueError("manifest command is not allowlisted")
+
+    case_path = Path(raw_case_path).resolve()
+    cases_root = CASES_ROOT.resolve()
+    try:
+        case_path.relative_to(cases_root)
+    except ValueError as exc:
+        raise ValueError("manifest case path is outside the allowlisted root") from exc
+    if case_path.name != task.case_id or case_path.parent.name != task.project:
+        raise ValueError("manifest case identity does not match its allowlisted path")
+    if not (case_path / "case.yaml").is_file():
+        raise ValueError("manifest case path is not an allowlisted case")
+    return [
+        sys.executable,
+        str(REPLAY_PY.resolve()),
+        "lint-task",
+        "--run",
+        str(case_path),
+    ]
+
+
+async def run_task(
+    task: Task,
+    semaphore: asyncio.Semaphore,
+    manifest_path: Path,
+    manifest_lock: asyncio.Lock,
+):
     """Execute a single task with concurrency control."""
     async with semaphore:
         now = time.strftime("%Y-%m-%dT%H:%M:%S")
         task.status = "running"
         task.started_at = now
-        _save_manifest_checkpoint(manifest_path, task)
+        async with manifest_lock:
+            _save_manifest_checkpoint(manifest_path, task)
 
         start = time.monotonic()
         try:
@@ -189,7 +236,8 @@ async def run_task(task: Task, semaphore: asyncio.Semaphore, manifest_path: Path
 
         task.duration_s = round(time.monotonic() - start, 2)
         task.finished_at = time.strftime("%Y-%m-%dT%H:%M:%S")
-        _save_manifest_checkpoint(manifest_path, task)
+        async with manifest_lock:
+            _save_manifest_checkpoint(manifest_path, task)
         return task
 
 
@@ -213,7 +261,13 @@ async def run_manifest(args):
         sys.exit(1)
 
     manifest = Manifest.from_dict(json.loads(manifest_path.read_text()))
+    for task in manifest.tasks:
+        task.args = compile_manifest_task(task)
     max_conc = getattr(args, "max_concurrency", None) or manifest.max_concurrency
+    if not isinstance(max_conc, int) or not 1 <= max_conc <= DEFAULT_MAX_CONCURRENCY:
+        raise ValueError(
+            f"manifest concurrency must be 1..{DEFAULT_MAX_CONCURRENCY}"
+        )
 
     if getattr(args, "dry_run", False):
         pending = [t for t in manifest.tasks if t.status == "pending"]
@@ -231,9 +285,10 @@ async def run_manifest(args):
 
     print(f"Running {len(pending)} tasks (concurrency={max_conc})")
     semaphore = asyncio.Semaphore(max_conc)
+    manifest_lock = asyncio.Lock()
 
     tasks_coros = [
-        run_task(t, semaphore, manifest_path)
+        run_task(t, semaphore, manifest_path, manifest_lock)
         for t in pending
     ]
     results = await asyncio.gather(*tasks_coros, return_exceptions=True)
@@ -289,12 +344,15 @@ async def run_package_phase(project: str, phase: str, max_concurrency: int, pack
         sys.exit(1)
 
     if phase == "finalize":
-        print(f"[finalize] Verifying all packages...")
-        # Finalize just verifies — no actual work needed beyond what orchestrate.sh handles
-        print(f"[finalize] Done.")
+        plan_root = Path(orchestrator).resolve().parent
+        outcome = finalize_batch(plan_root)
+        print(f"[finalize] {'Done' if outcome['ok'] else 'Failed'}: {outcome}")
+        if not outcome["ok"]:
+            sys.exit(1)
         return
 
-    semaphore = asyncio.Semaphore(max_concurrency)
+    effective_concurrency = phase_concurrency(phase, max_concurrency)
+    semaphore = asyncio.Semaphore(effective_concurrency)
     all_tasks = []
 
     for case_info in cases:
@@ -311,8 +369,7 @@ async def run_package_phase(project: str, phase: str, max_concurrency: int, pack
                     operation="lint-task",
                     args=[
                         sys.executable, str(REPLAY_PY), "lint-task",
-                        "--case", case_id,
-                        "--cases-root", str(CASES_ROOT),
+                        "--run", str(case_path),
                     ],
                 ))
 
@@ -334,7 +391,7 @@ async def run_package_phase(project: str, phase: str, max_concurrency: int, pack
         print(f"No tasks for {project}/{phase}")
         return
 
-    print(f"Running {len(all_tasks)} tasks for {project}/{phase} (concurrency={max_concurrency})")
+    print(f"Running {len(all_tasks)} tasks for {project}/{phase} (concurrency={effective_concurrency})")
     results = await asyncio.gather(
         *[run_task_live(t, semaphore) for t in all_tasks],
         return_exceptions=True,
@@ -342,6 +399,16 @@ async def run_package_phase(project: str, phase: str, max_concurrency: int, pack
 
     completed = sum(1 for r in results if isinstance(r, Task) and r.status == "completed")
     failed = sum(1 for r in results if isinstance(r, Task) and r.status in ("failed", "error"))
+    if orchestrator:
+        _write_package_result(
+            Path(orchestrator).resolve().parent,
+            package_id=package_id,
+            project=project,
+            phase=phase,
+            total=len(all_tasks),
+            completed=completed,
+            failed=failed,
+        )
     print(f"\n[{project}/{phase}] Done: {completed} completed, {failed} failed out of {len(all_tasks)} total")
 
     if failed > 0:
@@ -350,6 +417,91 @@ async def run_package_phase(project: str, phase: str, max_concurrency: int, pack
                 err_line = r.stderr.strip().split("\n")[-1][:120] if r.stderr else "no stderr"
                 print(f"  FAILED: {r.case_id} | {err_line}")
         sys.exit(1)
+
+
+def _write_package_result(
+    plan_root: Path,
+    *,
+    package_id: str,
+    project: str,
+    phase: str,
+    total: int,
+    completed: int,
+    failed: int,
+) -> None:
+    results_dir = plan_root / "status" / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "package_id": package_id,
+        "project": project,
+        "phase": phase,
+        "total": total,
+        "completed": completed,
+        "failed": failed,
+        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    tmp = results_dir / f".{package_id}.tmp"
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.replace(results_dir / f"{package_id}.json")
+
+
+def finalize_batch(plan_root: Path) -> dict[str, object]:
+    results_dir = plan_root / "status" / "results"
+    results: list[dict[str, object]] = []
+    if results_dir.is_dir():
+        for path in sorted(results_dir.glob("*.json")):
+            results.append(json.loads(path.read_text(encoding="utf-8")))
+    total = sum(int(result.get("total", 0)) for result in results)
+    completed = sum(int(result.get("completed", 0)) for result in results)
+    failed = sum(int(result.get("failed", 0)) for result in results)
+    result_ids = {str(result.get("package_id", "")) for result in results}
+    expected_ids: set[str] = set()
+    graph_path = plan_root / "launchers" / "package-graph.tsv"
+    if graph_path.is_file():
+        for index, line in enumerate(graph_path.read_text(encoding="utf-8").splitlines()):
+            if index == 0 or not line.strip():
+                continue
+            columns = line.split("\t")
+            if len(columns) == 10 and columns[9] != "1":
+                expected_ids.add(columns[0])
+    missing_packages = sorted(expected_ids - result_ids)
+    ok = bool(results) and not missing_packages and failed == 0 and completed == total
+    outcome = "landed" if ok else "failed-no-merge"
+    lines = [
+        "# Batch Case Processing - Final Report",
+        "",
+        "## Task-Level Outcome",
+        "",
+        outcome,
+        "",
+        "## Package Results",
+        "",
+        "| Package | Project | Phase | Completed | Failed | Total |",
+        "|---|---|---|---:|---:|---:|",
+    ]
+    for result in results:
+        lines.append(
+            f"| {result.get('package_id', '')} | {result.get('project', '')} | "
+            f"{result.get('phase', '')} | {result.get('completed', 0)} | "
+            f"{result.get('failed', 0)} | {result.get('total', 0)} |"
+        )
+    lines.extend([
+        "",
+        "## Summary",
+        "",
+        f"- Completed tasks: {completed}/{total}",
+        f"- Failed tasks: {failed}",
+        f"- Missing package results: {', '.join(missing_packages) if missing_packages else 'none'}",
+        "",
+    ])
+    (plan_root / "FINAL_REPORT.md").write_text("\n".join(lines), encoding="utf-8")
+    return {
+        "ok": ok,
+        "completed": completed,
+        "failed": failed,
+        "total": total,
+        "missing_packages": missing_packages,
+    }
 
 
 async def run_task_live(task: Task, semaphore: asyncio.Semaphore) -> Task:

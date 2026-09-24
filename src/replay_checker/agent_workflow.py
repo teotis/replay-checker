@@ -119,7 +119,7 @@ def run_grading_flow(
     scoring_packages: list[Path] = []
     for run_id in selected:
         run = load_run(runs_root, run_id, cases_root=cases_root)
-        collect_run(run)
+        collect_run(run, prune_workspace=True)
         scoring_packages.append(score_run(run, rubric_path=rubric_path))
     report = compare_case(case, runs_root=runs_root, reports_root=reports_root)
     return GradingFlowResult(

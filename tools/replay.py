@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +23,8 @@ from replay_checker.replay import (  # noqa: E402
     load_case,
     load_run,
     prepare_run,
+    prune_run_workspaces,
+    release_run_workspace,
     report_all_cases,
     score_run,
 )
@@ -150,6 +153,13 @@ def cmd_extract_skill_evals(args: argparse.Namespace) -> int:
 
 def cmd_prepare_run(args: argparse.Namespace) -> int:
     case = load_case(args.cases_root, args.case)
+    if args.check:
+        with tempfile.TemporaryDirectory(prefix="replay-prepare-check-") as tmp:
+            run = prepare_run(case, runs_root=Path(tmp) / "runs", runner_label=args.label)
+            release_run_workspace(run)
+        print(f"Prepare-run check passed: {case.id}")
+        print("Workspace: released")
+        return 0
     run = prepare_run(case, runs_root=args.runs_root, runner_label=args.label)
     print(f"Prepared run: {run.root}")
     print(f"Workspace: {run.workspace}")
@@ -160,9 +170,11 @@ def cmd_prepare_run(args: argparse.Namespace) -> int:
 
 def cmd_collect_run(args: argparse.Namespace) -> int:
     run = load_run(args.runs_root, args.run, cases_root=args.cases_root)
-    evidence = collect_run(run)
+    evidence = collect_run(run, prune_workspace=not args.keep_workspace)
     health = inspect_run_dir(run.root)
     print(f"Collected run: {evidence.run_id} status={health.status} raw={evidence.status}")
+    if not args.keep_workspace:
+        print("Workspace: released after evidence collection")
     if health.status != "completed":
         print(f"Reason: {health.reason}")
     return 0
@@ -282,6 +294,27 @@ def cmd_doctor_runs(args: argparse.Namespace) -> int:
             f"{'yes' if report.has_result_diff else 'no'} | "
             f"{len(report.changed_files)} | {report.run_id} | {report.reason} |"
         )
+    return 0
+
+
+def cmd_prune_run_workspaces(args: argparse.Namespace) -> int:
+    result = prune_run_workspaces(
+        runs_root=args.runs_root,
+        cases_root=args.cases_root,
+        runner_label=args.label,
+        include_prepared=args.include_prepared,
+        dry_run=not args.apply,
+    )
+    mode = "applied" if args.apply else "dry-run"
+    print(
+        f"Prune run workspaces ({mode}): "
+        f"scanned={result['scanned']} eligible={result['eligible']} "
+        f"pruned={result['pruned']} errors={result['errors']}"
+    )
+    if not args.apply and result["eligible"]:
+        print("Re-run with --apply to remove eligible workspaces.")
+    if result["errors"]:
+        return 1
     return 0
 
 
@@ -457,11 +490,18 @@ def cmd_lint_task(args: argparse.Namespace) -> int:
 
     run_root = _P(args.run)
     diagnostics = lint_task(run_root)
-    if diagnostics:
-        for msg in diagnostics:
-            print(f"ERROR: {msg}", file=sys.stderr)
+    errors = [diagnostic for diagnostic in diagnostics if diagnostic.severity == "error"]
+    warnings = [diagnostic for diagnostic in diagnostics if diagnostic.severity != "error"]
+    for diagnostic in warnings:
+        print(f"WARNING: {diagnostic}", file=sys.stderr)
+    if errors:
+        for diagnostic in errors:
+            print(f"ERROR: {diagnostic}", file=sys.stderr)
         return 1
-    print("Lint clean: task package is well-formed.")
+    if warnings:
+        print(f"Lint passed with {len(warnings)} warning(s).")
+    else:
+        print("Lint clean: task package is well-formed.")
     return 0
 
 
@@ -530,6 +570,7 @@ def cmd_audit_cases(args: argparse.Namespace) -> int:
         prune_unusable=args.prune_unusable,
         prune_low_confidence=args.prune_low_confidence,
         prune_duplicates=args.prune_duplicates,
+        repair_task_depth=getattr(args, "repair_task_depth", False),
         dry_run=args.dry_run,
     )
     action = "Would remove" if args.dry_run else "Removed"
@@ -538,6 +579,7 @@ def cmd_audit_cases(args: argparse.Namespace) -> int:
     print(f"Low-confidence cases: {len(report.low_confidence_case_ids)}")
     print(f"Exact duplicate cases: {len(report.duplicate_case_ids)}")
     print(f"{action} cases: {len(report.removed_case_ids)}")
+    print(f"Repaired task depth: {len(report.repaired_case_ids)}")
 
     if args.verbose and report.issues:
         print()
@@ -623,12 +665,16 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--runs-root", default="runs")
     prepare.add_argument("--case", required=True)
     prepare.add_argument("--label", required=True)
+    prepare.add_argument("--check", action="store_true", default=False,
+                         help="validate workspace creation using a temporary run and release it immediately")
     prepare.set_defaults(func=cmd_prepare_run)
 
     collect = sub.add_parser("collect-run", help="collect evidence after the user-driven agent run")
     collect.add_argument("--cases-root", default="cases")
     collect.add_argument("--runs-root", default="runs")
     collect.add_argument("--run", required=True)
+    collect.add_argument("--keep-workspace", action="store_true", default=False,
+                         help="retain the execution workspace after evidence collection")
     collect.set_defaults(func=cmd_collect_run)
 
     score = sub.add_parser("score-run", help="create an anonymized scoring task package")
@@ -658,6 +704,16 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--label", default=None, help="only inspect runs with this runner_label")
     doctor.add_argument("--format", choices=("table", "tsv"), default="table")
     doctor.set_defaults(func=cmd_doctor_runs)
+
+    prune_ws = sub.add_parser("prune-run-workspaces", help="release or prune eligible run workspaces")
+    prune_ws.add_argument("--cases-root", default="cases")
+    prune_ws.add_argument("--runs-root", default="runs")
+    prune_ws.add_argument("--label", default=None, help="only inspect runs with this runner_label")
+    prune_ws.add_argument("--include-prepared", action="store_true", default=False,
+                          help="also prune prepared-only workspaces that have no collected evidence")
+    prune_ws.add_argument("--apply", action="store_true", default=False,
+                          help="perform pruning; default is dry-run")
+    prune_ws.set_defaults(func=cmd_prune_run_workspaces)
 
     flow = sub.add_parser(
         "flow",
@@ -746,6 +802,8 @@ def build_parser() -> argparse.ArgumentParser:
                                     help="remove cases whose base_confidence is low")
     audit_cases_parser.add_argument("--prune-duplicates", action="store_true", default=False,
                                     help="remove exact duplicate cases")
+    audit_cases_parser.add_argument("--repair-task-depth", action="store_true", default=False,
+                                    help="add conservative situation-depth sections to legacy task files")
     audit_cases_parser.add_argument("--dry-run", action="store_true", default=False,
                                     help="show removals without deleting")
     audit_cases_parser.add_argument("--verbose", action="store_true", default=False,

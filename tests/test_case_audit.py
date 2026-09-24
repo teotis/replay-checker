@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from replay_checker.case_audit import audit_cases
+from replay_checker.case_audit import audit_cases, repair_case_task_depth
+from replay_checker.linters import lint_task
 from replay_checker.yaml_lite import write_simple_yaml
 
 
@@ -88,3 +89,32 @@ def test_audit_cases_cli_prunes_low_confidence_cases(tmp_path: Path, capsys) -> 
     assert "Low-confidence cases: 1" in output
     assert "Removed cases: 1" in output
     assert not low_case.exists()
+
+
+def test_repair_case_task_depth_makes_legacy_case_lint_clean(tmp_path: Path) -> None:
+    cases_root = tmp_path / "cases"
+    case_dir = _write_case(cases_root, "legacy-case")
+    assert any(issue.code.startswith("depth.missing_") for issue in lint_task(case_dir))
+
+    changed = repair_case_task_depth(case_dir)
+
+    assert changed is True
+    assert not [issue for issue in lint_task(case_dir) if issue.code.startswith("depth.missing_")]
+    task_text = (case_dir / "task.md").read_text(encoding="utf-8")
+    assert "## Situation Context" in task_text
+    assert "## Failure Boundaries" in task_text
+    assert "## Observable Acceptance Signals" in task_text
+
+
+def test_audit_cases_reports_and_repairs_legacy_task_depth(tmp_path: Path) -> None:
+    cases_root = tmp_path / "cases"
+    case_dir = _write_case(cases_root, "legacy-case")
+
+    before = audit_cases(cases_root)
+    assert any(issue.code.startswith("depth.missing_") for issue in before.issues)
+
+    after = audit_cases(cases_root, repair_task_depth=True)
+
+    assert after.repaired_case_ids == ("legacy-case",)
+    assert not any(issue.code.startswith("depth.missing_") for issue in after.issues)
+    assert "## Situation Context" in (case_dir / "task.md").read_text(encoding="utf-8")

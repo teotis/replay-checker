@@ -67,6 +67,11 @@ echo "Concurrency: $CONCURRENCY"
 [ -n "$PROJECT_FILTER" ] && echo "Project:     $PROJECT_FILTER"
 echo ""
 
+if [ "$CMD" = "status" ]; then
+    python3 tools/concurrent_tasks.py status --manifest "$MANIFEST"
+    exit 0
+fi
+
 # Step 1: Generate manifest
 echo "[1/2] Generating task manifest..."
 GEN_ARGS="generate-manifest --max-concurrency $CONCURRENCY"

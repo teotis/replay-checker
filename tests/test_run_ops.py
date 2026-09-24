@@ -10,7 +10,7 @@ import pytest
 from replay_checker.core import stable_hash
 from replay_checker.evaluation import TaskOutcomeEntry, append_task_outcome
 from replay_checker.git_utils import git_run
-from replay_checker.replay_types import ReplayCase, RunHealth
+from replay_checker.replay_types import ReplayCase, ReplayRun, RunHealth
 from replay_checker.run_ops import (
     FORBIDDEN_PATH_PATTERNS,
     SENSITIVE_UNTRACKED_FILENAMES,
@@ -35,6 +35,8 @@ from replay_checker.run_ops import (
     load_case,
     load_run,
     prepare_run,
+    prune_run_workspaces,
+    release_run_workspace,
     validate_case,
 )
 from replay_checker.yaml_lite import write_simple_yaml
@@ -152,6 +154,96 @@ def test_prepare_run_uses_case_task_outcome_feedback(tmp_path: Path) -> None:
     task_text = (run.root / "TASK.md").read_text(encoding="utf-8")
     assert "prior outcome feedback is addressed: no observable fixture acceptance" in task_text
     assert "task-specific completion" in task_text
+
+
+def test_prepare_run_removes_reserved_run_dir_when_workspace_creation_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    _init_git_repo(project)
+    case = _make_case(tmp_path, base_commit="HEAD")
+    runs_root = tmp_path / "runs"
+
+    def fail_create_worktree(_case: ReplayCase, _workspace: Path) -> None:
+        raise RuntimeError("git worktree add timed out")
+
+    monkeypatch.setattr("replay_checker.run_ops._create_worktree", fail_create_worktree)
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        prepare_run(case, runs_root=runs_root, runner_label="test-agent")
+
+    assert list(runs_root.iterdir()) == []
+
+
+def test_prepare_run_check_does_not_persist_run_workspace(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    _init_git_repo(project)
+    _make_case(tmp_path, base_commit="HEAD")
+    runs_root = tmp_path / "runs"
+    replay_py = Path(__file__).resolve().parents[1] / "tools" / "replay.py"
+
+    result = subprocess.run(
+        [
+            "python3", str(replay_py), "prepare-run",
+            "--cases-root", str(tmp_path / "cases"),
+            "--runs-root", str(runs_root),
+            "--case", "test-case-1",
+            "--label", "check",
+            "--check",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Prepare-run check passed" in result.stdout
+    assert not runs_root.exists()
+
+
+def test_prune_run_workspaces_dry_run_preserves_prepared_workspace(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    _init_git_repo(project)
+    case = _make_case(tmp_path, base_commit="HEAD")
+    run = prepare_run(case, runs_root=tmp_path / "runs", runner_label="batch-run")
+
+    result = prune_run_workspaces(
+        runs_root=tmp_path / "runs",
+        cases_root=tmp_path / "cases",
+        runner_label="batch-run",
+        include_prepared=True,
+        dry_run=True,
+    )
+
+    assert result["eligible"] == 1
+    assert result["pruned"] == 0
+    assert run.workspace.exists()
+
+
+def test_prune_run_workspaces_can_prune_prepared_workspace(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    _init_git_repo(project)
+    case = _make_case(tmp_path, base_commit="HEAD")
+    run = prepare_run(case, runs_root=tmp_path / "runs", runner_label="batch-run")
+
+    result = prune_run_workspaces(
+        runs_root=tmp_path / "runs",
+        cases_root=tmp_path / "cases",
+        runner_label="batch-run",
+        include_prepared=True,
+        dry_run=False,
+    )
+
+    assert result["eligible"] == 1
+    assert result["pruned"] == 1
+    assert not run.workspace.exists()
+    data = (run.root / "run.yaml").read_text(encoding="utf-8")
+    assert "status: pruned" in data
+    assert "workspace_pruned: yes" in data
 
 
 # ---------------------------------------------------------------------------
@@ -310,14 +402,51 @@ def test_resolve_workspace_relative_default() -> None:
 
 def test_resolve_workspace_absolute() -> None:
     run_root = Path("/runs/case-1-001")
-    result = _resolve_workspace_path(run_root, {"workspace": "/tmp/custom"})
-    assert result == Path("/tmp/custom")
+    result = _resolve_workspace_path(
+        run_root, {"workspace": "/runs/case-1-001/custom"}
+    )
+    assert result == Path("/runs/case-1-001/custom")
+
+
+def test_resolve_workspace_rejects_absolute_path_outside_run_root() -> None:
+    run_root = Path("/runs/case-1-001")
+    with pytest.raises(ValueError, match="outside run root"):
+        _resolve_workspace_path(run_root, {"workspace": "/tmp/custom"})
 
 
 def test_resolve_workspace_runs_prefix() -> None:
     run_root = Path("/runs/case-1-001")
-    result = _resolve_workspace_path(run_root, {"workspace": "runs/shared-ws"})
-    assert result == Path("/runs/shared-ws")
+    with pytest.raises(ValueError, match="outside run root"):
+        _resolve_workspace_path(run_root, {"workspace": "runs/shared-ws"})
+
+
+def test_load_run_rejects_run_id_outside_runs_root(tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    write_simple_yaml(
+        outside / "run.yaml",
+        {"id": "outside", "case_id": "test-case-1", "workspace": "workspace"},
+    )
+
+    with pytest.raises(ValueError, match="single path component"):
+        load_run(runs_root, "../outside", cases_root=tmp_path / "cases")
+
+
+def test_load_run_rejects_symlink_run_root(tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (runs_root / "test-case-1-001").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="run root must not be a symlink"):
+        load_run(
+            runs_root,
+            "test-case-1-001",
+            cases_root=tmp_path / "cases",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +540,23 @@ def test_copy_project_tree_excludes_git(tmp_path: Path) -> None:
     assert (workspace / ".git").exists()  # new repo init
 
 
+def test_copy_project_tree_excludes_generated_run_artifacts(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "keep.py").write_text("ok\n", encoding="utf-8")
+    for generated in ("runs", "reports", "work", "outputs", ".tmp", ".cache", "tmp"):
+        path = project / generated
+        path.mkdir()
+        (path / "artifact.txt").write_text("large generated output\n", encoding="utf-8")
+
+    workspace = tmp_path / "workspace"
+    _copy_project_tree(project, workspace)
+
+    assert (workspace / "keep.py").exists()
+    for generated in ("runs", "reports", "work", "outputs", ".tmp", ".cache", "tmp"):
+        assert not (workspace / generated).exists()
+
+
 # ---------------------------------------------------------------------------
 # inspect_run_dir health
 # ---------------------------------------------------------------------------
@@ -478,6 +624,47 @@ def test_collect_run_produces_evidence(tmp_path: Path) -> None:
     assert len(evidence.changed_files) >= 0  # may or may not show changes vs base
     evidence_yaml = run.root / "evidence" / "evidence.yaml"
     assert evidence_yaml.exists()
+
+
+def test_collect_run_can_prune_workspace_after_evidence_collection(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    _init_git_repo(project)
+    case = _make_case(tmp_path, base_commit="HEAD")
+
+    run = prepare_run(case, runs_root=tmp_path / "runs", runner_label="test-agent")
+    (run.workspace / "new.py").write_text("print('hi')\n", encoding="utf-8")
+    (run.workspace / "completion_report.md").write_text(
+        "status: completed\n\nDid stuff.\n", encoding="utf-8",
+    )
+
+    evidence = collect_run(run, prune_workspace=True)
+
+    assert evidence.status == "completed"
+    assert (run.root / "completion_report.md").read_text(encoding="utf-8").startswith("status: completed")
+    assert (run.root / "evidence" / "evidence.yaml").exists()
+    assert not run.workspace.exists()
+
+    health = inspect_run_dir(run.root)
+    assert health.status == "completed"
+    assert health.workspace_exists is False
+    assert health.has_result_diff is True
+
+
+def test_release_run_workspace_rejects_workspace_outside_run_root(
+    tmp_path: Path,
+) -> None:
+    case = _make_case(tmp_path)
+    run_root = tmp_path / "runs" / "test-case-1-001"
+    run_root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    run = ReplayRun("test-case-1-001", run_root, case, "test-agent", outside)
+
+    with pytest.raises(ValueError, match="outside run root"):
+        release_run_workspace(run)
+
+    assert outside.exists()
 
 
 def test_collect_run_skips_sensitive_untracked(tmp_path: Path) -> None:

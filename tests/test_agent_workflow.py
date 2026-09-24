@@ -132,6 +132,7 @@ def test_external_extraction_kit_status_runs_outside_target_project(tmp_path: Pa
 
     assert result.returncode == 0, result.stderr
     assert "Coordinator consistency" in result.stdout
+    assert (flow.kit_path / "status" / "strict-evidence").read_text(encoding="utf-8") == "v1\n"
 
 
 def test_generated_orchestrator_parses_colored_claude_session_id(tmp_path: Path) -> None:

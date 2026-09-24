@@ -534,6 +534,7 @@ def _write_kit_files(
         generate_state_tsv(packages),
         encoding="utf-8",
     )
+    (status_dir / "strict-evidence").write_text("v1\n", encoding="utf-8")
     for pkg in packages:
         (status_dir / f"{pkg.package_id}.md").write_text(
             generate_status_md(pkg),
